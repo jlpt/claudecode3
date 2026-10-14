@@ -1,0 +1,19 @@
+# Game ROMs and anything derived from them must never be committed.
+*.z64
+*.n64
+*.v64
+*.rom
+*.zip
+*.7z
+RecompiledFuncs/
+RecompiledPatches/
+
+# Build output.
+build/
+build-*/
+cmake-build/
+tools/build/
+
+# Runtime files written next to the executable.
+saves/
+*.log

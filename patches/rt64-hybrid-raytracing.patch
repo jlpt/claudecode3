@@ -1,0 +1,2661 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 79dfc38..e786775 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,8 @@ option(RT64_STATIC "Build RT64 as a static library" OFF)
+ 
+ option(RT64_SDL_WINDOW_VULKAN "Build RT64 to expect an SDL Window outside of Windows" OFF)
+ 
++option(RT64_HYBRID_RT "Build the hybrid ray traced shadows and ambient occlusion pass" ON)
++
+ if (NOT ${RT64_STATIC})
+     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ endif()
+@@ -371,6 +373,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_buffer_uploader.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_framebuffer_renderer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_geometry_mode.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_hybrid_raytracing.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_look_at_processor.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_native_target.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_optimus.cpp"
+@@ -555,5 +558,17 @@ build_pixel_shader(  rt64 "src/shaders/DebugPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/Im3DPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
+ 
++# Hybrid ray traced shadows and ambient occlusion. Not available on macOS, as the Metal backend doesn't support ray tracing pipelines.
++if (RT64_HYBRID_RT AND NOT APPLE)
++    target_compile_definitions(rt64 PRIVATE RT64_HYBRID_RT_ENABLED=1)
++    build_compute_shader(rt64 "src/shaders/HybridRtWorldCS.hlsl")
++    build_compute_shader(rt64 "src/shaders/HybridRtDepthCopyCS.hlsl")
++    build_compute_shader(rt64 "src/shaders/HybridRtDepthCopyCS.hlsl" "src/shaders/HybridRtDepthCopyCSMS.hlsl" "-D MULTISAMPLING")
++    build_ray_shader(    rt64 "src/shaders/HybridRtTraceRT.hlsl")
++    build_compute_shader(rt64 "src/shaders/HybridRtDenoiseCS.hlsl")
++    build_compute_shader(rt64 "src/shaders/HybridRtStatsCS.hlsl")
++    build_pixel_shader(  rt64 "src/shaders/HybridRtCompositePS.hlsl")
++endif()
++
+ target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/src)
+ 
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index 785de27..bc0e0ce 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -6,6 +6,8 @@
+ #include "rhi/rt64_render_hooks.h"
+ 
+ #include <cinttypes>
++#include <cstdlib>
++#include <cstring>
+ #include <filesystem>
+ 
+ #include "common/rt64_dynamic_libraries.h"
+@@ -40,6 +42,14 @@ namespace RT64 {
+ #endif
+     }
+ 
++    static void applyHybridRtEnvironment(HybridRaytracingConfiguration &config) {
++        // The RT64_HYBRID_RT environment variable can force hybrid ray tracing off (0) or on (1).
++        const char *hybridRtEnv = getenv("RT64_HYBRID_RT");
++        if (hybridRtEnv != nullptr) {
++            config.enabled = (strcmp(hybridRtEnv, "0") != 0);
++        }
++    }
++
+     // Application::Core
+ 
+     VI Application::Core::decodeVI() const {
+@@ -390,6 +400,18 @@ namespace RT64 {
+         sharedQueueResources->setUserConfig(userConfig, false);
+         sharedQueueResources->setEmulatorConfig(emulatorConfig);
+         sharedQueueResources->setEnhancementConfig(enhancementConfig);
++
++        // Load the hybrid ray tracing configuration.
++        const std::filesystem::path hybridRtConfigPath = HybridRaytracingConfiguration::defaultPath();
++        std::error_code hybridRtConfigError;
++        hybridRtConfigWriteTime = std::filesystem::last_write_time(hybridRtConfigPath, hybridRtConfigError);
++        hybridRtConfigCheckTime = std::chrono::steady_clock::now();
++        if (hybridRtConfig.load(hybridRtConfigPath)) {
++            fprintf(stdout, "RT64: Loaded hybrid ray tracing configuration from %s.\n", hybridRtConfigPath.string().c_str());
++        }
++
++        applyHybridRtEnvironment(hybridRtConfig);
++        sharedQueueResources->setHybridRtConfig(hybridRtConfig);
+         sharedQueueResources->setSwapChainSize(swapChain->getWidth(), swapChain->getHeight());
+         sharedQueueResources->setSwapChainRate(appWindow->getRefreshRate());
+         sharedQueueResources->renderTargetManager.setMultisampling(multisampling);
+@@ -412,6 +434,8 @@ namespace RT64 {
+         workloadExt.blueNoiseTexture = blueNoiseTexture.texture.get();
+ #   endif
+         workloadQueue->setup(workloadExt);
++        fprintf(stdout, "RT64: Hybrid ray tracing is %s on this device.\n", isHybridRtSupported() ? "supported" : "not supported");
++        fflush(stdout);
+ 
+         PresentQueue::External presentExt;
+         presentExt.appWindow = appWindow.get();
+@@ -511,6 +535,7 @@ namespace RT64 {
+ 
+     void Application::updateScreen() {
+         appWindow->sdlCheckFilterInstallation();
++        checkHybridRtConfigUpdates();
+         screenApiProfiler.logAndRestart();
+         state->updateScreen(core.decodeVI(), false);
+     }
+@@ -647,6 +672,12 @@ namespace RT64 {
+         }
+         case DeveloperShortcut::RayTracing: {
+             workloadQueue->rtEnabled = !workloadQueue->rtEnabled;
++
++            // Also toggle the hybrid ray traced shadows and ambient occlusion.
++            hybridRtConfig.enabled = !hybridRtConfig.enabled;
++            updateHybridRtConfig();
++            fprintf(stdout, "RT64: Hybrid ray tracing turned %s with the developer shortcut.\n", hybridRtConfig.enabled ? "on" : "off");
++            fflush(stdout);
+             break;
+         }
+         case DeveloperShortcut::ViewRDRAM: {
+@@ -750,6 +781,45 @@ namespace RT64 {
+         sharedQueueResources->setEnhancementConfig(enhancementConfig);
+     }
+ 
++    void Application::updateHybridRtConfig() {
++        sharedQueueResources->setHybridRtConfig(hybridRtConfig);
++    }
++
++    void Application::checkHybridRtConfigUpdates() {
++        // Reload the hybrid ray tracing configuration whenever its file is modified, so it can be tuned while the game runs.
++        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
++        if ((now - hybridRtConfigCheckTime) < std::chrono::seconds(1)) {
++            return;
++        }
++
++        hybridRtConfigCheckTime = now;
++
++        const std::filesystem::path configPath = HybridRaytracingConfiguration::defaultPath();
++        std::error_code ec;
++        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(configPath, ec);
++        if (ec || (writeTime == hybridRtConfigWriteTime)) {
++            return;
++        }
++
++        hybridRtConfigWriteTime = writeTime;
++
++        // Keep the current configuration if the file can't be parsed, as it might still be in the middle of being written.
++        HybridRaytracingConfiguration newConfig;
++        if (!newConfig.load(configPath)) {
++            return;
++        }
++
++        applyHybridRtEnvironment(newConfig);
++        hybridRtConfig = newConfig;
++        updateHybridRtConfig();
++        fprintf(stdout, "RT64: Reloaded hybrid ray tracing configuration from %s.\n", configPath.string().c_str());
++        fflush(stdout);
++    }
++
++    bool Application::isHybridRtSupported() const {
++        return (workloadQueue != nullptr) && (workloadQueue->framebufferRenderer != nullptr) && workloadQueue->framebufferRenderer->isHybridRaytracingSupported();
++    }
++
+     void Application::setFullScreen(bool fullscreen) {
+         appWindow->setFullScreen(fullscreen);
+     }
+diff --git a/src/hle/rt64_application.h b/src/hle/rt64_application.h
+index 6c83fe0..59d4985 100644
+--- a/src/hle/rt64_application.h
++++ b/src/hle/rt64_application.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <sstream>
+ #include <filesystem>
+ 
+@@ -138,6 +139,9 @@ namespace RT64 {
+         uint32_t threadsAvailable;
+         ProfilingTimer dlApiProfiler = ProfilingTimer(120);
+         ProfilingTimer screenApiProfiler = ProfilingTimer(120);
++        HybridRaytracingConfiguration hybridRtConfig;
++        std::filesystem::file_time_type hybridRtConfigWriteTime;
++        std::chrono::steady_clock::time_point hybridRtConfigCheckTime;
+ 
+ #   if RT_ENABLED
+         RaytracingConfiguration rtConfig;
+@@ -171,6 +175,9 @@ namespace RT64 {
+         void updateUserConfig(bool discardFBs);
+         void updateEmulatorConfig();
+         void updateEnhancementConfig();
++        void updateHybridRtConfig();
++        void checkHybridRtConfigUpdates();
++        bool isHybridRtSupported() const;
+         void setFullScreen(bool fullscreen);
+     };
+ };
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8858dac..0eb086a 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -9,6 +9,7 @@
+ #include "common/rt64_common.h"
+ #include "common/rt64_emulator_configuration.h"
+ #include "common/rt64_enhancement_configuration.h"
++#include "render/rt64_hybrid_raytracing.h"
+ #include "render/rt64_render_target_manager.h"
+ 
+ #include "rt64_framebuffer_manager.h"
+@@ -35,7 +36,9 @@ namespace RT64 {
+         UserConfiguration userConfig;
+         EnhancementConfiguration enhancementConfig;
+         EmulatorConfiguration emulatorConfig;
++        HybridRaytracingConfiguration hybridRtConfig;
+         bool swapChainSizeChanged = false;
++        bool hybridRtConfigChanged = true;
+         bool rtConfigChanged = true;
+         bool userConfigChanged = true;
+         bool fbConfigChanged = true;
+@@ -90,6 +93,12 @@ namespace RT64 {
+             enhancementConfig = newEnhancementConfig;
+         }
+ 
++        void setHybridRtConfig(const HybridRaytracingConfiguration &newHybridRtConfig) {
++            std::scoped_lock<std::mutex> configurationLock(configurationMutex);
++            hybridRtConfig = newHybridRtConfig;
++            hybridRtConfigChanged = true;
++        }
++
+         void updateMultisampling(const RenderMultisampling &multisampling) {
+             interpolatedFrames[0].skipped = true;
+             interpolatedFrames[1].skipped = true;
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 2970e71..26ca26e 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -2419,6 +2419,80 @@ namespace RT64 {
+                     ImGui::EndTabItem();
+                 }
+                 
++                if (ImGui::BeginTabItem("Hybrid RT")) {
++                    HybridRaytracingConfiguration &hybridConfig = ext.app->hybridRtConfig;
++                    bool hybridChanged = false;
++                    if (!ext.app->isHybridRtSupported()) {
++                        ImGui::TextWrapped("Hybrid ray tracing is not supported by the current graphics device or API.");
++                        ImGui::NewLine();
++                    }
++                    else {
++                        const std::string hybridStatus = ext.workloadQueue->framebufferRenderer->getHybridRaytracingStatus();
++                        ImGui::TextWrapped("Status: %s", hybridStatus.c_str());
++                        ImGui::NewLine();
++                    }
++
++                    hybridChanged = ImGui::Checkbox("Enabled", &hybridConfig.enabled) || hybridChanged;
++                    hybridChanged = ImGui::Checkbox("Sun shadows", &hybridConfig.shadows) || hybridChanged;
++                    ImGui::BeginDisabled(!hybridConfig.shadows);
++                    hybridChanged = ImGui::DragFloat("Sun azimuth", &hybridConfig.sunAzimuthDegrees, 0.5f, -360.0f, 360.0f, "%.1f deg") || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("Sun elevation", &hybridConfig.sunElevationDegrees, 0.5f, -90.0f, 90.0f, "%.1f deg") || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("Sun angular radius", &hybridConfig.sunAngularRadiusDegrees, 0.05f, 0.0f, 20.0f, "%.2f deg") || hybridChanged;
++                    hybridChanged = ImGui::SliderFloat("Shadow strength", &hybridConfig.shadowStrength, 0.0f, 1.0f) || hybridChanged;
++                    hybridChanged = ImGui::SliderFloat("Facing away darkening", &hybridConfig.nDotLStrength, 0.0f, 1.0f) || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("Shadow max distance", &hybridConfig.shadowMaxDistance, 10.0f, 1.0f, 1000000.0f) || hybridChanged;
++                    ImGui::EndDisabled();
++                    hybridChanged = ImGui::Checkbox("Ambient occlusion", &hybridConfig.ambientOcclusion) || hybridChanged;
++                    ImGui::BeginDisabled(!hybridConfig.ambientOcclusion);
++                    hybridChanged = ImGui::SliderInt("AO samples", &hybridConfig.aoSamples, 0, 16) || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("AO radius", &hybridConfig.aoRadius, 1.0f, 1.0f, 10000.0f) || hybridChanged;
++                    hybridChanged = ImGui::SliderFloat("AO strength", &hybridConfig.aoStrength, 0.0f, 1.0f) || hybridChanged;
++                    ImGui::EndDisabled();
++                    hybridChanged = ImGui::DragFloat("Normal bias", &hybridConfig.normalBias, 0.1f, 0.0f, 100.0f) || hybridChanged;
++                    hybridChanged = ImGui::SliderInt("Denoise radius", &hybridConfig.denoiseRadius, 0, 16) || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("Denoise depth sigma", &hybridConfig.denoiseDepthSigma, 0.001f, 0.0001f, 1.0f, "%.4f") || hybridChanged;
++                    hybridChanged = ImGui::DragFloat("Denoise normal power", &hybridConfig.denoiseNormalPower, 0.1f, 0.0f, 64.0f) || hybridChanged;
++                    hybridChanged = ImGui::Checkbox("Interior detection", &hybridConfig.interiorDetection) || hybridChanged;
++                    ImGui::BeginDisabled(!hybridConfig.interiorDetection);
++                    hybridChanged = ImGui::SliderFloat("Interior fade start", &hybridConfig.interiorFadeStart, 0.0f, 1.0f) || hybridChanged;
++                    hybridChanged = ImGui::SliderFloat("Interior fade end", &hybridConfig.interiorFadeEnd, 0.0f, 1.0f) || hybridChanged;
++                    ImGui::EndDisabled();
++                    hybridChanged = ImGui::Checkbox("Alpha tested casters", &hybridConfig.alphaTestedCasters) || hybridChanged;
++                    hybridChanged = ImGui::Checkbox("Temporal noise", &hybridConfig.temporalNoise) || hybridChanged;
++
++                    int hybridDebugView = int(hybridConfig.debugView);
++                    hybridChanged = ImGui::Combo("Debug view", &hybridDebugView, "None\0Shadows\0Ambient occlusion\0Combined\0Normals\0") || hybridChanged;
++                    hybridConfig.debugView = HybridRaytracingConfiguration::DebugView(hybridDebugView);
++
++                    if (hybridChanged) {
++                        hybridConfig.validate();
++                        ext.app->updateHybridRtConfig();
++                    }
++
++                    const std::filesystem::path hybridConfigPath = HybridRaytracingConfiguration::defaultPath();
++                    ImGui::NewLine();
++                    if (ImGui::Button("Save")) {
++                        if (!hybridConfig.save(hybridConfigPath)) {
++                            fprintf(stderr, "RT64: Failed to save the hybrid ray tracing configuration to %s.\n", hybridConfigPath.string().c_str());
++                        }
++                    }
++
++                    ImGui::SameLine();
++                    if (ImGui::Button("Reload")) {
++                        hybridConfig.load(hybridConfigPath);
++                        ext.app->updateHybridRtConfig();
++                    }
++
++                    ImGui::SameLine();
++                    if (ImGui::Button("Defaults")) {
++                        hybridConfig = HybridRaytracingConfiguration();
++                        ext.app->updateHybridRtConfig();
++                    }
++
++                    ImGui::TextWrapped("Configuration file: %s", hybridConfigPath.string().c_str());
++                    ImGui::EndTabItem();
++                }
++
+                 if (ImGui::BeginTabItem("Render")) {
+                     if (ImPlot::BeginPlot("Frametimes")) {
+                         const double FrametimeLimit = 20.0;
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 5a331aa..afd91d7 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -236,6 +236,11 @@ namespace RT64 {
+         // Store the rate that was chosen for the configuration.
+         ext.sharedResources->targetRate = workloadConfig.targetRate;
+ 
++        if (ext.sharedResources->hybridRtConfigChanged) {
++            framebufferRenderer->setHybridRaytracingConfig(ext.sharedResources->hybridRtConfig);
++            ext.sharedResources->hybridRtConfigChanged = false;
++        }
++
+ #   if RT_ENABLED
+         workloadConfig.raytracingEnabled = rtEnabled;
+ 
+@@ -601,6 +606,21 @@ namespace RT64 {
+                 fbManager.performDiscards(fbPair.startFbDiscards);
+             }
+             
++            // Pick the framebuffer pair and camera the hybrid ray tracing pass will be applied to.
++            HybridRaytracingSelection hybridSelection;
++            if (!framebufferRenderer->isHybridRaytracingSupported()) {
++                framebufferRenderer->setHybridRaytracingStatus("unavailable", "the device doesn't support ray tracing");
++            }
++            else if (!framebufferRenderer->hybridRaytracer->getConfiguration().active()) {
++                framebufferRenderer->setHybridRaytracingStatus("disabled");
++            }
++            else {
++                hybridSelection = FramebufferRenderer::selectHybridRaytracingScene(workload, fbPairCount, framebufferRenderer->hybridRaytracer->getConfiguration());
++                if (hybridSelection.fbPairIndex < 0) {
++                    framebufferRenderer->setHybridRaytracingStatus("inactive", "no 3D scene with shadow casters in this frame");
++                }
++            }
++
+             // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
+             scratchFbChangePool.reset();
+             fbManager.resetOperations();
+@@ -639,6 +659,9 @@ namespace RT64 {
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
++                    drawParams.hybridRtEnabled = (int32_t(f) == hybridSelection.fbPairIndex);
++                    drawParams.hybridRtTransformsIndex = hybridSelection.transformsIndex;
++                    drawParams.curFrameWeight = curFrameWeight;
+                     framebufferRenderer->addFramebuffer(drawParams);
+                 }
+                 
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 9fae0d4..16b39a2 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -158,6 +158,23 @@ namespace RT64 {
+             rtResources = std::make_unique<RaytracingResources>(worker, graphicsAPI);
+     }
+ #   endif
++
++        // Only the high resolution renderer applies the hybrid ray tracing pass.
++        if (rtSupport) {
++            RenderShaderFormat hybridShaderFormat = RenderShaderFormat::UNKNOWN;
++            switch (graphicsAPI) {
++            case UserConfiguration::GraphicsAPI::D3D12:
++                hybridShaderFormat = RenderShaderFormat::DXIL;
++                break;
++            case UserConfiguration::GraphicsAPI::Vulkan:
++                hybridShaderFormat = RenderShaderFormat::SPIRV;
++                break;
++            default:
++                break;
++            }
++
++            hybridRaytracer = std::make_unique<HybridRaytracer>(worker->device, hybridShaderFormat);
++        }
+     }
+ 
+     FramebufferRenderer::~FramebufferRenderer() {
+@@ -175,6 +192,12 @@ namespace RT64 {
+         frameParams.viewUbershaders = ubershadersVisible;
+         frameParams.ditherNoiseStrength = ditherNoiseStrength;
+         framebufferCount = 0;
++        hybridScene.active = false;
++        hybridScene.cameraFound = false;
++        hybridScene.casterIndices.clear();
++        if (hybridRaytracer != nullptr) {
++            hybridRaytracer->reset();
++        }
+ 
+         // Create dummy color target if it hasn't been created yet.
+         if (dummyColorTarget == nullptr) {
+@@ -1206,6 +1229,11 @@ namespace RT64 {
+             vertexProcessor->recordCommandList(worker, shaderLibrary, outputBuffers);
+         }
+ 
++        // Compute the world space geometry and build the acceleration structures for the hybrid ray tracing pass.
++        if ((hybridRaytracer != nullptr) && hybridRaytracer->isPrepared()) {
++            hybridRaytracer->recordSetup(worker->commandList.get());
++        }
++
+ #   if RT_ENABLED
+         if (rtEnabled) {
+             assert(rtResources != nullptr);
+@@ -1250,7 +1278,9 @@ namespace RT64 {
+ 
+         bool depthState = false;
+         worker->commandList->setFramebuffer(targetDrawCall.fbStorage->colorDepthWrite.get());
+-        for (const auto &pair : targetDrawCall.sceneIndices) {
++        const bool hybridFramebuffer = isHybridRaytracingActive() && (hybridScene.framebufferIndex == framebufferIndex) && (targetDrawCall.hybridRtSceneIndex >= 0);
++        for (uint32_t sceneIndex = 0; sceneIndex < uint32_t(targetDrawCall.sceneIndices.size()); sceneIndex++) {
++            const auto &pair = targetDrawCall.sceneIndices[sceneIndex];
+ #       if RT_ENABLED
+             if (pair.second) {
+                 const auto &rtScene = targetDrawCall.rtScenes[pair.first];
+@@ -1298,7 +1328,128 @@ namespace RT64 {
+                 submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
+                 submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
+             }
++
++            // Apply the hybrid ray tracing pass once the 3D scene has been drawn, before the HUD.
++            if (hybridFramebuffer && (int32_t(sceneIndex) == targetDrawCall.hybridRtSceneIndex)) {
++                submitHybridRaytracing(worker, framebuffer, depthState);
++            }
++        }
++    }
++
++    bool FramebufferRenderer::isHybridRaytracingSupported() const {
++        return (hybridRaytracer != nullptr) && hybridRaytracer->isSupported();
++    }
++
++    void FramebufferRenderer::setHybridRaytracingConfig(const HybridRaytracingConfiguration &config) {
++        if (hybridRaytracer != nullptr) {
++            hybridRaytracer->setConfiguration(config);
++        }
++    }
++
++    void FramebufferRenderer::setHybridRaytracingStatus(const std::string &kind, const std::string &details) {
++        const std::scoped_lock<std::mutex> statusLock(hybridStatusMutex);
++        hybridStatus = details.empty() ? kind : (kind + ": " + details);
++
++        // Only log when the kind of status changes to avoid printing every frame.
++        if (hybridStatusKind != kind) {
++            hybridStatusKind = kind;
++            fprintf(stdout, "RT64: Hybrid ray tracing %s.\n", hybridStatus.c_str());
++            fflush(stdout);
++        }
++    }
++
++    std::string FramebufferRenderer::getHybridRaytracingStatus() {
++        const std::scoped_lock<std::mutex> statusLock(hybridStatusMutex);
++        return hybridStatus;
++    }
++
++    bool FramebufferRenderer::isHybridRaytracingActive() const {
++        return hybridScene.active && (hybridRaytracer != nullptr) && hybridRaytracer->isPrepared();
++    }
++
++    void FramebufferRenderer::submitHybridRaytracing(RenderWorker *worker, const Framebuffer &framebuffer, bool &depthState) {
++        RenderFramebufferStorage *fbStorage = framebuffer.renderTargetDrawCall.fbStorage;
++        RenderTarget *colorTarget = fbStorage->colorTarget;
++        RenderTarget *depthTarget = fbStorage->depthTarget;
++        if ((colorTarget == nullptr) || (depthTarget == nullptr)) {
++            return;
++        }
++
++        HybridRaytracingTarget target;
++        target.colorTexture = colorTarget->texture.get();
++        target.depthTexture = depthTarget->texture.get();
++        target.depthTextureView = depthTarget->textureView.get();
++        target.framebuffer = fbStorage->colorWriteDepthRead.get();
++        target.colorFormat = colorTarget->format;
++        target.depthFormat = depthTarget->format;
++        target.multisampling = colorTarget->multisampling;
++        target.width = std::min({ uint32_t(std::lround(framebuffer.viewport.width)), colorTarget->width, depthTarget->width });
++        target.height = std::min({ uint32_t(std::lround(framebuffer.viewport.height)), colorTarget->height, depthTarget->height });
++        hybridRaytracer->recordPass(worker->commandList.get(), target);
++
++        // The pass leaves the color write and depth read framebuffer bound.
++        depthState = true;
++    }
++
++    bool FramebufferRenderer::isHybridRaytracingCaster(const GameCall &call, const HybridRaytracingConfiguration &config) {
++        const interop::OtherMode &otherMode = call.callDesc.otherMode;
++        const uint32_t cycleType = otherMode.cycleType();
++        if ((cycleType == G_CYC_FILL) || (cycleType == G_CYC_COPY)) {
++            return false;
+         }
++
++        if (call.callDesc.extendedType != DrawExtendedType::None) {
++            return false;
++        }
++
++        // Only solid geometry that writes depth can cast shadows. Decals are coplanar with the surfaces they're on.
++        if (!otherMode.zUpd() || (otherMode.zMode() == ZMODE_DEC)) {
++            return false;
++        }
++
++        // Cutouts have no texture information in the acceleration structure and would cast fully opaque shadows.
++        const bool alphaTested = (otherMode.alphaCompare() != G_AC_NONE) || otherMode.cvgXAlpha();
++        if (alphaTested && !config.alphaTestedCasters) {
++            return false;
++        }
++
++        return call.callDesc.triangleCount > 0;
++    }
++
++    HybridRaytracingSelection FramebufferRenderer::selectHybridRaytracingScene(const Workload &workload, uint32_t fbPairCount, const HybridRaytracingConfiguration &config) {
++        // Pick the perspective projection with the most shadow casting triangles. The framebuffer pair it belongs
++        // to is considered the main 3D scene of the frame.
++        HybridRaytracingSelection selection;
++        uint32_t bestTriangleCount = 0;
++        for (uint32_t f = 0; f < fbPairCount; f++) {
++            const FramebufferPair &fbPair = workload.fbPairs[f];
++            if (!fbPair.depthWrite) {
++                continue;
++            }
++
++            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
++                const Projection &proj = fbPair.projections[p];
++                if ((proj.type != Projection::Type::Perspective) || proj.scissorRect.isNull()) {
++                    continue;
++                }
++
++                uint32_t triangleCount = 0;
++                for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                    const GameCall &call = proj.gameCalls[d];
++                    if (isHybridRaytracingCaster(call, config)) {
++                        triangleCount += call.callDesc.triangleCount;
++                    }
++                }
++
++                if (triangleCount > bestTriangleCount) {
++                    bestTriangleCount = triangleCount;
++                    selection.fbPairIndex = int32_t(f);
++                    selection.transformsIndex = proj.transformsIndex;
++                }
++            }
++        }
++
++        return selection;
+     }
+ 
+     void FramebufferRenderer::waitForUploaders() {
+@@ -1430,6 +1581,7 @@ namespace RT64 {
+ 
+         targetDrawCall.fbStorage = p.fbStorage;
+         targetDrawCall.sceneIndices.clear();
++        targetDrawCall.hybridRtSceneIndex = -1;
+ 
+         const float SimilarityPercentage = 0.1f; // TODO: Make more strict once VI ratios are in.
+         const float scissorRatio = static_cast<float>(fbPair.scissorRect.width(false, true)) / static_cast<float>(fbPair.scissorRect.height(false, true));
+@@ -1450,6 +1602,38 @@ namespace RT64 {
+         uint32_t vertexTestZFaceIndicesStart = 0;
+         int32_t vertexTestZCallIndex = -1;
+         RenderViewport viewportClip;
++
++        // Hybrid ray tracing. The framebuffer pair chosen as the main 3D scene of the frame collects the shadow casters
++        // and the point in the raster scene after which the pass must be applied.
++        const bool hybridFramebuffer = p.hybridRtEnabled && !hybridScene.active && isHybridRaytracingSupported() && (p.fbStorage->colorTarget != nullptr) && (p.hybridRtTransformsIndex < drawData.viewProjTransforms.size());
++        size_t hybridSplitInstanceCount = 0;
++        auto hybridViewProj = [&](uint32_t transformsIndex) -> const interop::float4x4 & {
++            // Use the same transform that was uploaded to the GPU for rasterization.
++            return (transformsIndex < drawData.modViewProjTransforms.size()) ? drawData.modViewProjTransforms[transformsIndex] : drawData.viewProjTransforms[transformsIndex];
++        };
++
++        auto hybridCompatibleProjection = [&](uint32_t transformsIndex) {
++            if (transformsIndex == p.hybridRtTransformsIndex) {
++                return true;
++            }
++
++            const float MatrixThreshold = 1e-3f;
++            const float ViewportThreshold = 1e-3f;
++            const interop::RSPViewport &a = drawData.rspViewports[transformsIndex];
++            const interop::RSPViewport &b = drawData.rspViewports[p.hybridRtTransformsIndex];
++            const bool sameViewport =
++                (std::abs(a.scale.x - b.scale.x) < ViewportThreshold) && (std::abs(a.scale.y - b.scale.y) < ViewportThreshold) && (std::abs(a.scale.z - b.scale.z) < ViewportThreshold) &&
++                (std::abs(a.translate.x - b.translate.x) < ViewportThreshold) && (std::abs(a.translate.y - b.translate.y) < ViewportThreshold) && (std::abs(a.translate.z - b.translate.z) < ViewportThreshold) &&
++                (drawData.viewportOrigins[transformsIndex] == drawData.viewportOrigins[p.hybridRtTransformsIndex]);
++
++            return sameViewport && (matrixDifference(hybridViewProj(transformsIndex), hybridViewProj(p.hybridRtTransformsIndex)) < MatrixThreshold);
++        };
++
++        if (hybridFramebuffer) {
++            hybridScene.casterIndices.clear();
++            hybridScene.cameraFound = false;
++        }
++
+         for (uint32_t pr = 0; (pr < fbPair.projectionCount) && (globalCallIndex < p.maxGameCall); pr++) {
+             const Projection &proj = fbPair.projections[pr];
+             if (proj.scissorRect.isNull()) {
+@@ -1506,8 +1690,24 @@ namespace RT64 {
+                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
+             }
+ 
++            // Projections that share the camera of the hybrid ray tracing pass contribute to the acceleration structure.
++            const bool hybridProj = hybridFramebuffer && (proj.type == Projection::Type::Perspective) && hybridCompatibleProjection(proj.transformsIndex);
++            if (hybridProj && (proj.transformsIndex == p.hybridRtTransformsIndex) && !hybridScene.cameraFound) {
++                HybridRaytracingCamera &camera = hybridScene.camera;
++                camera.viewProj = hybridViewProj(proj.transformsIndex);
++                camera.viewport = drawData.rspViewports[proj.transformsIndex];
++                camera.fbResolution = fbParams.resolution;
++                camera.screenScale = triangles.screenScale;
++                camera.screenOffset = triangles.screenOffset;
++                camera.targetWidth = framebuffer.viewport.width;
++                camera.targetHeight = framebuffer.viewport.height;
++                hybridScene.transformsIndex = proj.transformsIndex;
++                hybridScene.cameraFound = true;
++            }
++
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+                 const GameCall &call = proj.gameCalls[d];
++                bool hybridSplitCall = false;
+                 renderIndices.instanceIndex = call.callDesc.callIndex;
+                 renderIndices.faceIndicesStart = call.meshDesc.faceIndicesStart;
+                 renderIndices.rdpTileIndex = call.callDesc.tileIndex;
+@@ -1631,6 +1831,18 @@ namespace RT64 {
+                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
+                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
+                             invRatioScale = projInvRatioScale;
++
++                            // The pass is applied after the last solid draw call of the scene, so every opaque surface receives shadows.
++                            if (hybridProj && !triangles.vertexTestZ && call.callDesc.otherMode.zUpd()) {
++                                hybridSplitCall = true;
++
++                                const uint32_t indexStart = call.meshDesc.faceIndicesStart;
++                                const uint32_t indexCount = call.callDesc.triangleCount * 3;
++                                if (isHybridRaytracingCaster(call, hybridRaytracer->getConfiguration()) && ((size_t(indexStart) + indexCount) <= drawData.faceIndices.size())) {
++                                    hybridScene.casterIndices.insert(hybridScene.casterIndices.end(), drawData.faceIndices.begin() + indexStart, drawData.faceIndices.begin() + indexStart + indexCount);
++                                }
++                            }
++
+                             break;
+                         }
+                         case Projection::Type::Rectangle: {
+@@ -1747,6 +1959,10 @@ namespace RT64 {
+ #           endif
+                 {
+                     rasterScene.instanceIndices.push_back(instanceIndex);
++
++                    if (hybridSplitCall) {
++                        hybridSplitInstanceCount = rasterScene.instanceIndices.size();
++                    }
+                 }
+ 
+                 instanceDrawCallVector.push_back(instanceDrawCall);
+@@ -1757,6 +1973,41 @@ namespace RT64 {
+ #   if RT_ENABLED
+         checkRtScene(rtScene);
+ #   endif
++
++        // Split the raster scene at the point where the hybrid ray tracing pass must be applied.
++        const bool hybridValid = hybridFramebuffer && hybridScene.cameraFound && (hybridSplitInstanceCount > 0) &&
++            (hybridSplitInstanceCount <= rasterScene.instanceIndices.size()) && (hybridScene.casterIndices.size() >= 3);
++
++        if (hybridValid) {
++            RasterScene remainingScene;
++            remainingScene.instanceIndices.assign(rasterScene.instanceIndices.begin() + hybridSplitInstanceCount, rasterScene.instanceIndices.end());
++            rasterScene.instanceIndices.resize(hybridSplitInstanceCount);
++            checkRasterScene(rasterScene);
++            targetDrawCall.hybridRtSceneIndex = int32_t(targetDrawCall.sceneIndices.size()) - 1;
++            rasterScene = std::move(remainingScene);
++
++            hybridScene.active = true;
++            hybridScene.framebufferIndex = framebufferCount - 1;
++            hybridScene.vertexCount = drawData.vertexCount();
++            hybridScene.curFrameWeight = p.curFrameWeight;
++        }
++        else if (hybridFramebuffer) {
++            if (!hybridScene.cameraFound) {
++                setHybridRaytracingStatus("inactive", "the camera of the main scene wasn't found");
++            }
++            else if (hybridSplitInstanceCount == 0) {
++                setHybridRaytracingStatus("inactive", "the main scene has no solid geometry");
++            }
++            else {
++                setHybridRaytracingStatus("inactive", "the main scene has no shadow casters");
++            }
++
++            hybridScene.casterIndices.clear();
++        }
++        else if (p.hybridRtEnabled && (p.fbStorage->colorTarget == nullptr)) {
++            setHybridRaytracingStatus("inactive", "the main scene has no color target");
++        }
++
+         checkRasterScene(rasterScene);
+     }
+ 
+@@ -1816,6 +2067,29 @@ namespace RT64 {
+         }
+ #   endif
+ 
++        // Upload the geometry and parameters for the hybrid ray tracing pass.
++        if (hybridScene.active) {
++            HybridRaytracingGeometry geometry;
++            geometry.positionBuffer = drawBuffers->positionBuffer.get();
++            geometry.positionView = drawBuffers->positionBuffer.getView(0);
++            geometry.velocityBuffer = drawBuffers->velocityBuffer.get();
++            geometry.velocityView = drawBuffers->velocityBuffer.getView(0);
++            geometry.worldIndicesBuffer = drawBuffers->worldIndicesBuffer.get();
++            geometry.worldIndicesView = drawBuffers->worldIndicesBuffer.getView(0);
++            geometry.worldTransformsBuffer = drawBuffers->worldTransformsBuffer.get();
++            geometry.vertexCount = hybridScene.vertexCount;
++            geometry.curFrameWeight = hybridScene.curFrameWeight;
++            geometry.indices = hybridScene.casterIndices.data();
++            geometry.indexCount = uint32_t(hybridScene.casterIndices.size());
++            if (hybridRaytracer->prepare(geometry, hybridScene.camera, frameParams.frameCount)) {
++                setHybridRaytracingStatus("active", std::to_string(hybridScene.casterIndices.size() / 3) + " shadow casting triangles in framebuffer " + std::to_string(hybridScene.framebufferIndex));
++            }
++            else {
++                setHybridRaytracingStatus("inactive", "the geometry couldn't be prepared");
++                hybridScene.active = false;
++            }
++        }
++
+         shaderUploader->submit(worker, shaderUploads);
+         updateShaderViews(worker, drawBuffers, outputBuffers, shaderViewRtEnabled);
+     }
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 3add9c3..44dc08d 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <stdint.h>
++#include <mutex>
++#include <string>
+ 
+ #include "common/rt64_emulator_configuration.h"
+ #include "common/rt64_user_configuration.h"
+@@ -19,6 +21,7 @@
+ #include "rt64_buffer_uploader.h"
+ #include "rt64_descriptor_sets.h"
+ #include "rt64_framebuffer_renderer_call.h"
++#include "rt64_hybrid_raytracing.h"
+ #include "rt64_raster_shader_cache.h"
+ #include "rt64_render_target.h"
+ #include "rt64_rsp_processor.h"
+@@ -51,6 +54,15 @@ namespace RT64 {
+ #   if RT_ENABLED
+         std::vector<RaytracingScene> rtScenes;
+ #   endif
++
++        // Index into sceneIndices of the raster scene after which the hybrid ray tracing pass is submitted. Negative if unused.
++        int32_t hybridRtSceneIndex = -1;
++    };
++
++    // Selection of the framebuffer pair and camera that the hybrid ray tracing pass will be applied to.
++    struct HybridRaytracingSelection {
++        int32_t fbPairIndex = -1;
++        uint32_t transformsIndex = 0;
+     };
+ 
+     struct RSPSmoothNormalGenerationCB {
+@@ -111,6 +123,24 @@ namespace RT64 {
+         bool rtSupport = false;
+ #   endif
+ 
++        // Hybrid ray traced shadows and ambient occlusion.
++        struct HybridScene {
++            bool active = false;
++            bool cameraFound = false;
++            uint32_t framebufferIndex = 0;
++            uint32_t transformsIndex = 0;
++            uint32_t vertexCount = 0;
++            float curFrameWeight = 1.0f;
++            HybridRaytracingCamera camera;
++            std::vector<uint32_t> casterIndices;
++        };
++
++        std::unique_ptr<HybridRaytracer> hybridRaytracer;
++        HybridScene hybridScene;
++        std::mutex hybridStatusMutex;
++        std::string hybridStatus;
++        std::string hybridStatusKind;
++
+         struct Framebuffer {
+             std::unique_ptr<RenderBuffer> paramsBuffer;
+             std::unique_ptr<FramebufferRendererDescriptorFramebufferSet> descRealFbSet;
+@@ -147,6 +177,9 @@ namespace RT64 {
+             bool postBlendNoise;
+             bool postBlendNoiseNegative;
+             uint32_t maxGameCall;
++            bool hybridRtEnabled = false;
++            uint32_t hybridRtTransformsIndex = 0;
++            float curFrameWeight = 1.0f;
+         };
+ 
+         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);
+@@ -172,6 +205,16 @@ namespace RT64 {
+         void waitForUploaders();
+         void advanceFrame(bool rtEnabled);
+ 
++        // Hybrid ray tracing.
++        bool isHybridRaytracingSupported() const;
++        void setHybridRaytracingConfig(const HybridRaytracingConfiguration &config);
++        bool isHybridRaytracingActive() const;
++        void setHybridRaytracingStatus(const std::string &kind, const std::string &details = std::string());
++        std::string getHybridRaytracingStatus();
++        void submitHybridRaytracing(RenderWorker *worker, const Framebuffer &framebuffer, bool &depthState);
++        static HybridRaytracingSelection selectHybridRaytracingScene(const Workload &workload, uint32_t fbPairCount, const HybridRaytracingConfiguration &config);
++        static bool isHybridRaytracingCaster(const GameCall &call, const HybridRaytracingConfiguration &config);
++
+ #   if RT_ENABLED
+         void resetRaytracing(RaytracingShaderCache *rtShaderCache, const RenderTexture *blueNoiseTexture);
+         void updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene);
+diff --git a/src/render/rt64_hybrid_raytracing.cpp b/src/render/rt64_hybrid_raytracing.cpp
+new file mode 100644
+index 0000000..95e9ee8
+--- /dev/null
++++ b/src/render/rt64_hybrid_raytracing.cpp
+@@ -0,0 +1,986 @@
++//
++// RT64
++//
++
++#include "rt64_hybrid_raytracing.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++
++// RT64_HYBRID_RT_ENABLED is defined by the build when the shaders for this pass are compiled (all platforms but macOS).
++#if RT64_HYBRID_RT_ENABLED
++#include "shaders/FullScreenVS.hlsl.spirv.h"
++#include "shaders/HybridRtWorldCS.hlsl.spirv.h"
++#include "shaders/HybridRtDepthCopyCS.hlsl.spirv.h"
++#include "shaders/HybridRtDepthCopyCSMS.hlsl.spirv.h"
++#include "shaders/HybridRtTraceRT.hlsl.spirv.h"
++#include "shaders/HybridRtDenoiseCS.hlsl.spirv.h"
++#include "shaders/HybridRtStatsCS.hlsl.spirv.h"
++#include "shaders/HybridRtCompositePS.hlsl.spirv.h"
++
++#ifdef _WIN32
++#   include "shaders/FullScreenVS.hlsl.dxil.h"
++#   include "shaders/HybridRtWorldCS.hlsl.dxil.h"
++#   include "shaders/HybridRtDepthCopyCS.hlsl.dxil.h"
++#   include "shaders/HybridRtDepthCopyCSMS.hlsl.dxil.h"
++#   include "shaders/HybridRtTraceRT.hlsl.dxil.h"
++#   include "shaders/HybridRtDenoiseCS.hlsl.dxil.h"
++#   include "shaders/HybridRtStatsCS.hlsl.dxil.h"
++#   include "shaders/HybridRtCompositePS.hlsl.dxil.h"
++#   define HYBRID_SHADER_BLOB(NAME, FORMAT) \
++        ((FORMAT) == RenderShaderFormat::DXIL) ? static_cast<const void *>(NAME##BlobDXIL) : static_cast<const void *>(NAME##BlobSPIRV), \
++        ((FORMAT) == RenderShaderFormat::DXIL) ? sizeof(NAME##BlobDXIL) : sizeof(NAME##BlobSPIRV)
++#else
++#   define HYBRID_SHADER_BLOB(NAME, FORMAT) static_cast<const void *>(NAME##BlobSPIRV), sizeof(NAME##BlobSPIRV)
++#endif
++#endif
++
++namespace RT64 {
++    static const RenderFormat HybridDepthFormat = RenderFormat::R32_FLOAT;
++    static const RenderFormat HybridVisibilityFormat = RenderFormat::R16G16_FLOAT;
++    static const RenderFormat HybridNormalDepthFormat = RenderFormat::R16G16B16A16_FLOAT;
++    static const RenderBufferFlags HybridUAVBufferFlags = RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS;
++    static const RenderTextureFlags HybridUAVTextureFlags = RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS;
++    static const char *HybridRayGenName = "HybridRayGen";
++    static const char *HybridMissName = "HybridMiss";
++    static const char *HybridClosestHitName = "HybridClosestHit";
++    static const char *HybridHitGroupName = "HybridHitGroup";
++    static const float DegreesToRadians = 3.14159265358979f / 180.0f;
++
++    static uint64_t roundUpSize(uint64_t value, uint64_t alignment) {
++        return ((value + alignment - 1) / alignment) * alignment;
++    }
++
++    // Descriptor sets.
++
++    struct HybridWorldDescriptorSet : RenderDescriptorSetBase {
++        uint32_t srcPos;
++        uint32_t srcVel;
++        uint32_t srcIndices;
++        uint32_t worldMats;
++        uint32_t dstPos;
++
++        HybridWorldDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            srcPos = builder.addFormattedBuffer(1);
++            srcVel = builder.addFormattedBuffer(2);
++            srcIndices = builder.addFormattedBuffer(3);
++            worldMats = builder.addStructuredBuffer(4);
++            dstPos = builder.addReadWriteStructuredBuffer(5);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct HybridDepthCopyDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gInputDepth;
++        uint32_t gOutputDepth;
++
++        HybridDepthCopyDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gInputDepth = builder.addTexture(1);
++            gOutputDepth = builder.addReadWriteTexture(2);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct HybridTraceDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gParams;
++        uint32_t SceneBVH;
++        uint32_t gDepth;
++        uint32_t gOutput;
++        uint32_t gNormalDepth;
++
++        HybridTraceDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gParams = builder.addConstantBuffer(0);
++            SceneBVH = builder.addAccelerationStructure(1);
++            gDepth = builder.addTexture(2);
++            gOutput = builder.addReadWriteTexture(3);
++            gNormalDepth = builder.addReadWriteTexture(4);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct HybridDenoiseDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gParams;
++        uint32_t gInput;
++        uint32_t gNormalDepth;
++        uint32_t gOutput;
++        uint32_t gDepth;
++
++        HybridDenoiseDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gParams = builder.addConstantBuffer(1);
++            gInput = builder.addTexture(2);
++            gNormalDepth = builder.addTexture(3);
++            gOutput = builder.addReadWriteTexture(4);
++            gDepth = builder.addTexture(5);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct HybridStatsDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gParams;
++        uint32_t gVisibility;
++        uint32_t gNormalDepth;
++        uint32_t gStats;
++
++        HybridStatsDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gParams = builder.addConstantBuffer(1);
++            gVisibility = builder.addTexture(2);
++            gNormalDepth = builder.addTexture(3);
++            gStats = builder.addReadWriteStructuredBuffer(4);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct HybridCompositeDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gParams;
++        uint32_t gFiltered;
++        uint32_t gNormalDepth;
++        uint32_t gStats;
++
++        HybridCompositeDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gParams = builder.addConstantBuffer(1);
++            gFiltered = builder.addTexture(2);
++            gNormalDepth = builder.addTexture(3);
++            gStats = builder.addStructuredBuffer(4);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    // HybridRaytracingConfiguration
++
++    hlslpp::float3 HybridRaytracingConfiguration::sunDirection() const {
++        const float azimuth = sunAzimuthDegrees * DegreesToRadians;
++        const float elevation = sunElevationDegrees * DegreesToRadians;
++        const float cosElevation = std::cos(elevation);
++        return hlslpp::normalize(hlslpp::float3(cosElevation * std::sin(azimuth), std::sin(elevation), cosElevation * std::cos(azimuth)));
++    }
++
++    void HybridRaytracingConfiguration::validate() {
++        sunElevationDegrees = std::clamp(sunElevationDegrees, -90.0f, 90.0f);
++        sunAngularRadiusDegrees = std::clamp(sunAngularRadiusDegrees, 0.0f, 20.0f);
++        shadowStrength = std::clamp(shadowStrength, 0.0f, 1.0f);
++        nDotLStrength = std::clamp(nDotLStrength, 0.0f, 1.0f);
++        shadowMaxDistance = std::max(shadowMaxDistance, 1.0f);
++        aoSamples = std::clamp(aoSamples, 0, 16);
++        aoRadius = std::max(aoRadius, 1.0f);
++        aoStrength = std::clamp(aoStrength, 0.0f, 1.0f);
++        normalBias = std::max(normalBias, 0.0f);
++        skyDepth = std::clamp(skyDepth, 0.0f, 1.0f);
++        denoiseRadius = std::clamp(denoiseRadius, 0, 16);
++        denoiseDepthSigma = std::max(denoiseDepthSigma, 1e-4f);
++        interiorFadeStart = std::clamp(interiorFadeStart, 0.0f, 1.0f);
++        interiorFadeEnd = std::clamp(interiorFadeEnd, interiorFadeStart + 1e-3f, 1.001f);
++        denoiseNormalPower = std::max(denoiseNormalPower, 0.0f);
++        debugView = std::clamp(debugView, DebugView::None, DebugView(int(DebugView::OptionCount) - 1));
++    }
++
++    bool HybridRaytracingConfiguration::active() const {
++        return enabled && (shadows || (ambientOcclusion && (aoSamples > 0)));
++    }
++
++    std::filesystem::path HybridRaytracingConfiguration::defaultPath() {
++        const char *envPath = std::getenv("RT64_HYBRID_RT_CONFIG");
++        if ((envPath != nullptr) && (envPath[0] != '\0')) {
++            return std::filesystem::path(envPath);
++        }
++
++        return std::filesystem::path("rt64_hybrid_rt.json");
++    }
++
++    bool HybridRaytracingConfiguration::load(const std::filesystem::path &path) {
++        std::ifstream stream(path);
++        if (!stream.is_open()) {
++            return false;
++        }
++
++        try {
++            nlohmann::json jroot;
++            stream >> jroot;
++            *this = jroot.value("hybridRaytracing", HybridRaytracingConfiguration());
++            validate();
++            return true;
++        }
++        catch (const nlohmann::detail::exception &e) {
++            fprintf(stderr, "Hybrid ray tracing configuration parsing error: %s\n", e.what());
++            *this = HybridRaytracingConfiguration();
++            return false;
++        }
++    }
++
++    bool HybridRaytracingConfiguration::save(const std::filesystem::path &path) const {
++        std::ofstream stream(path);
++        if (!stream.is_open()) {
++            return false;
++        }
++
++        nlohmann::json jroot;
++        jroot["hybridRaytracing"] = *this;
++        stream << std::setw(4) << jroot << std::endl;
++        return !stream.bad();
++    }
++
++    void to_json(nlohmann::json &j, const HybridRaytracingConfiguration &cfg) {
++        j["enabled"] = cfg.enabled;
++        j["shadows"] = cfg.shadows;
++        j["ambientOcclusion"] = cfg.ambientOcclusion;
++        j["sunAzimuthDegrees"] = cfg.sunAzimuthDegrees;
++        j["sunElevationDegrees"] = cfg.sunElevationDegrees;
++        j["sunAngularRadiusDegrees"] = cfg.sunAngularRadiusDegrees;
++        j["shadowStrength"] = cfg.shadowStrength;
++        j["nDotLStrength"] = cfg.nDotLStrength;
++        j["shadowMaxDistance"] = cfg.shadowMaxDistance;
++        j["aoSamples"] = cfg.aoSamples;
++        j["aoRadius"] = cfg.aoRadius;
++        j["aoStrength"] = cfg.aoStrength;
++        j["normalBias"] = cfg.normalBias;
++        j["skyDepth"] = cfg.skyDepth;
++        j["denoiseRadius"] = cfg.denoiseRadius;
++        j["denoiseDepthSigma"] = cfg.denoiseDepthSigma;
++        j["denoiseNormalPower"] = cfg.denoiseNormalPower;
++        j["interiorDetection"] = cfg.interiorDetection;
++        j["interiorFadeStart"] = cfg.interiorFadeStart;
++        j["interiorFadeEnd"] = cfg.interiorFadeEnd;
++        j["alphaTestedCasters"] = cfg.alphaTestedCasters;
++        j["temporalNoise"] = cfg.temporalNoise;
++        j["debugView"] = cfg.debugView;
++    }
++
++    void from_json(const nlohmann::json &j, HybridRaytracingConfiguration &cfg) {
++        HybridRaytracingConfiguration defaultCfg;
++        cfg.enabled = j.value("enabled", defaultCfg.enabled);
++        cfg.shadows = j.value("shadows", defaultCfg.shadows);
++        cfg.ambientOcclusion = j.value("ambientOcclusion", defaultCfg.ambientOcclusion);
++        cfg.sunAzimuthDegrees = j.value("sunAzimuthDegrees", defaultCfg.sunAzimuthDegrees);
++        cfg.sunElevationDegrees = j.value("sunElevationDegrees", defaultCfg.sunElevationDegrees);
++        cfg.sunAngularRadiusDegrees = j.value("sunAngularRadiusDegrees", defaultCfg.sunAngularRadiusDegrees);
++        cfg.shadowStrength = j.value("shadowStrength", defaultCfg.shadowStrength);
++        cfg.nDotLStrength = j.value("nDotLStrength", defaultCfg.nDotLStrength);
++        cfg.shadowMaxDistance = j.value("shadowMaxDistance", defaultCfg.shadowMaxDistance);
++        cfg.aoSamples = j.value("aoSamples", defaultCfg.aoSamples);
++        cfg.aoRadius = j.value("aoRadius", defaultCfg.aoRadius);
++        cfg.aoStrength = j.value("aoStrength", defaultCfg.aoStrength);
++        cfg.normalBias = j.value("normalBias", defaultCfg.normalBias);
++        cfg.skyDepth = j.value("skyDepth", defaultCfg.skyDepth);
++        cfg.denoiseRadius = j.value("denoiseRadius", defaultCfg.denoiseRadius);
++        cfg.denoiseDepthSigma = j.value("denoiseDepthSigma", defaultCfg.denoiseDepthSigma);
++        cfg.denoiseNormalPower = j.value("denoiseNormalPower", defaultCfg.denoiseNormalPower);
++        cfg.interiorDetection = j.value("interiorDetection", defaultCfg.interiorDetection);
++        cfg.interiorFadeStart = j.value("interiorFadeStart", defaultCfg.interiorFadeStart);
++        cfg.interiorFadeEnd = j.value("interiorFadeEnd", defaultCfg.interiorFadeEnd);
++        cfg.alphaTestedCasters = j.value("alphaTestedCasters", defaultCfg.alphaTestedCasters);
++        cfg.temporalNoise = j.value("temporalNoise", defaultCfg.temporalNoise);
++        cfg.debugView = j.value("debugView", defaultCfg.debugView);
++    }
++
++    // Camera.
++
++    hlslpp::float4x4 computeHybridPixelToWorld(const HybridRaytracingCamera &camera) {
++        // Invert the chain of transformations performed by RSPProcessCS and RasterVS:
++        //   ndc = clip.xyz / (w, -w, w)
++        //   screen = ndc * viewport.scale + viewport.translate
++        //   rasterNdc.xy = ((screen.xy - fbResolution / 2) / (fbResolution.x / 2, -fbResolution.y / 2)) * screenScale + screenOffset
++        //   depth = screen.z
++        // All of these are affine on each axis, so they're folded into a single matrix that's applied before the inverse view projection.
++        auto safeDivisor = [](float v) {
++            return (std::abs(v) > 1e-12f) ? v : 1.0f;
++        };
++
++        const float targetWidth = safeDivisor(camera.targetWidth);
++        const float targetHeight = safeDivisor(camera.targetHeight);
++        const float screenScaleX = safeDivisor(camera.screenScale.x);
++        const float screenScaleY = safeDivisor(camera.screenScale.y);
++        const float screenOffsetX = camera.screenOffset.x;
++        const float screenOffsetY = camera.screenOffset.y;
++        const float resolutionX = camera.fbResolution.x;
++        const float resolutionY = camera.fbResolution.y;
++        const float viewportScaleX = safeDivisor(camera.viewport.scale.x);
++        const float viewportScaleY = safeDivisor(camera.viewport.scale.y);
++        const float viewportScaleZ = safeDivisor(camera.viewport.scale.z);
++        const float viewportTranslateX = camera.viewport.translate.x;
++        const float viewportTranslateY = camera.viewport.translate.y;
++        const float viewportTranslateZ = camera.viewport.translate.z;
++
++        // X axis: pixel -> raster NDC -> undo screen scale/offset -> N64 screen -> N64 NDC.
++        float ax = 2.0f / targetWidth;
++        float bx = -1.0f;
++        bx = (bx - screenOffsetX) / screenScaleX;
++        ax = ax / screenScaleX;
++        bx = (bx + 1.0f) * resolutionX / 2.0f;
++        ax = ax * resolutionX / 2.0f;
++        bx = (bx - viewportTranslateX) / viewportScaleX;
++        ax = ax / viewportScaleX;
++
++        // Y axis: same chain, accounting for both inversions of the Y axis.
++        float ay = -2.0f / targetHeight;
++        float by = 1.0f;
++        by = (by - screenOffsetY) / screenScaleY;
++        ay = ay / screenScaleY;
++        by = (1.0f - by) * resolutionY / 2.0f;
++        ay = -ay * resolutionY / 2.0f;
++        by = -(by - viewportTranslateY) / viewportScaleY;
++        ay = -ay / viewportScaleY;
++
++        // Z axis: depth -> N64 NDC.
++        const float az = 1.0f / viewportScaleZ;
++        const float bz = -viewportTranslateZ / viewportScaleZ;
++
++        const hlslpp::float4x4 pixelToNdc(
++            ax, 0.0f, 0.0f, 0.0f,
++            0.0f, ay, 0.0f, 0.0f,
++            0.0f, 0.0f, az, 0.0f,
++            bx, by, bz, 1.0f
++        );
++
++        return hlslpp::mul(pixelToNdc, hlslpp::inverse(camera.viewProj));
++    }
++
++    static hlslpp::float3 computeHybridCameraPosition(const hlslpp::float4x4 &viewProj) {
++        // The eye is the only finite point that maps to clip coordinates with x = y = w = 0.
++        const hlslpp::float4x4 invViewProj = hlslpp::inverse(viewProj);
++        const hlslpp::float4 eye = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 1.0f, 0.0f), invViewProj);
++        const float w = eye.w;
++        if (std::abs(w) > 1e-12f) {
++            return eye.xyz / w;
++        }
++        else {
++            return hlslpp::float3(0.0f, 0.0f, 0.0f);
++        }
++    }
++
++    // HybridRaytracer
++
++    HybridRaytracer::HybridRaytracer(RenderDevice *device, RenderShaderFormat shaderFormat) {
++        assert(device != nullptr);
++
++        this->device = device;
++        this->shaderFormat = shaderFormat;
++
++#   if RT64_HYBRID_RT_ENABLED
++        const bool supportedFormat = (shaderFormat == RenderShaderFormat::SPIRV)
++#       ifdef _WIN32
++            || (shaderFormat == RenderShaderFormat::DXIL)
++#       endif
++            ;
++#   else
++        const bool supportedFormat = false;
++#   endif
++
++        supported = device->getCapabilities().raytracing && supportedFormat;
++        if (supported) {
++            createPipelines();
++        }
++    }
++
++    HybridRaytracer::~HybridRaytracer() { }
++
++    bool HybridRaytracer::isSupported() const {
++        return supported;
++    }
++
++    void HybridRaytracer::setConfiguration(const HybridRaytracingConfiguration &config) {
++        this->config = config;
++        this->config.validate();
++    }
++
++    const HybridRaytracingConfiguration &HybridRaytracer::getConfiguration() const {
++        return config;
++    }
++
++    void HybridRaytracer::createPipelines() {
++#   if RT64_HYBRID_RT_ENABLED
++        RenderPipelineLayoutBuilder layoutBuilder;
++
++        // World positions.
++        {
++            HybridWorldDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addPushConstant(0, 0, sizeof(interop::HybridRaytracingWorldCB), RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            worldLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> shader = device->createShader(HYBRID_SHADER_BLOB(HybridRtWorldCS, shaderFormat), "CSMain", shaderFormat);
++            worldPipeline = device->createComputePipeline(RenderComputePipelineDesc(worldLayout.get(), shader.get(), 64, 1, 1));
++            worldSet = std::make_unique<HybridWorldDescriptorSet>(device);
++        }
++
++        // Depth copy.
++        {
++            HybridDepthCopyDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addPushConstant(0, 0, sizeof(interop::HybridRaytracingDispatchCB), RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            depthCopyLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> shader = device->createShader(HYBRID_SHADER_BLOB(HybridRtDepthCopyCS, shaderFormat), "CSMain", shaderFormat);
++            depthCopyPipeline = device->createComputePipeline(RenderComputePipelineDesc(depthCopyLayout.get(), shader.get(), 8, 8, 1));
++
++            std::unique_ptr<RenderShader> shaderMS = device->createShader(HYBRID_SHADER_BLOB(HybridRtDepthCopyCSMS, shaderFormat), "CSMain", shaderFormat);
++            depthCopyMSPipeline = device->createComputePipeline(RenderComputePipelineDesc(depthCopyLayout.get(), shaderMS.get(), 8, 8, 1));
++            depthCopySet = std::make_unique<HybridDepthCopyDescriptorSet>(device);
++        }
++
++        // Ray tracing.
++        {
++            HybridTraceDescriptorSet descriptorSet;
++
++            // The layout is used as the local root signature of the pipeline on D3D12. Vulkan ignores the distinction.
++            layoutBuilder.begin(true);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            traceLayout = layoutBuilder.create(device);
++
++            // D3D12 requires the command list's compute root signature to match the (empty) global root signature of the
++            // state object. Identical root signatures are deduplicated by the runtime, so an empty layout matches it.
++            if (shaderFormat == RenderShaderFormat::DXIL) {
++                layoutBuilder.begin();
++                layoutBuilder.end();
++                traceGlobalLayout = layoutBuilder.create(device);
++            }
++
++            std::unique_ptr<RenderShader> shader = device->createShader(HYBRID_SHADER_BLOB(HybridRtTraceRT, shaderFormat), nullptr, shaderFormat);
++            const RenderRaytracingPipelineLibrarySymbol symbols[] = {
++                RenderRaytracingPipelineLibrarySymbol(HybridRayGenName, RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++                RenderRaytracingPipelineLibrarySymbol(HybridMissName, RenderRaytracingPipelineLibrarySymbolType::MISS),
++                RenderRaytracingPipelineLibrarySymbol(HybridClosestHitName, RenderRaytracingPipelineLibrarySymbolType::CLOSEST_HIT)
++            };
++
++            const RenderRaytracingPipelineLibrary library(shader.get(), symbols, uint32_t(std::size(symbols)));
++            const RenderRaytracingPipelineHitGroup hitGroup(HybridHitGroupName, HybridClosestHitName);
++            RenderRaytracingPipelineDesc pipelineDesc;
++            pipelineDesc.libraries = &library;
++            pipelineDesc.librariesCount = 1;
++            pipelineDesc.hitGroups = &hitGroup;
++            pipelineDesc.hitGroupsCount = 1;
++            pipelineDesc.pipelineLayout = traceLayout.get();
++            pipelineDesc.maxPayloadSize = sizeof(float);
++            pipelineDesc.maxAttributeSize = 2 * sizeof(float);
++            pipelineDesc.maxRecursionDepth = 1;
++            tracePipeline = device->createRaytracingPipeline(pipelineDesc);
++            traceSet = std::make_unique<HybridTraceDescriptorSet>(device);
++
++            // The shader binding table only depends on the pipeline and the descriptor set, which never change.
++            const RenderPipelineProgram rayGenProgram = tracePipeline->getProgram(HybridRayGenName);
++            const RenderPipelineProgram missProgram = tracePipeline->getProgram(HybridMissName);
++            const RenderPipelineProgram hitGroupProgram = tracePipeline->getProgram(HybridHitGroupName);
++            const RenderShaderBindingGroups bindingGroups(
++                RenderShaderBindingGroup(&rayGenProgram, 1),
++                RenderShaderBindingGroup(&missProgram, 1),
++                RenderShaderBindingGroup(&hitGroupProgram, 1)
++            );
++
++            RenderDescriptorSet *descriptorSets[] = { traceSet->get() };
++            device->setShaderBindingTableInfo(shaderBindingTableInfo, bindingGroups, tracePipeline.get(), descriptorSets, uint32_t(std::size(descriptorSets)));
++            shaderBindingTableBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(shaderBindingTableInfo.tableBufferData.size(), RenderBufferFlag::SHADER_BINDING_TABLE));
++            void *tableBytes = shaderBindingTableBuffer->map();
++            memcpy(tableBytes, shaderBindingTableInfo.tableBufferData.data(), shaderBindingTableInfo.tableBufferData.size());
++            shaderBindingTableBuffer->unmap();
++        }
++
++        // Denoising.
++        {
++            HybridDenoiseDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addPushConstant(0, 0, sizeof(interop::HybridRaytracingDispatchCB), RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            denoiseLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> shader = device->createShader(HYBRID_SHADER_BLOB(HybridRtDenoiseCS, shaderFormat), "CSMain", shaderFormat);
++            denoisePipeline = device->createComputePipeline(RenderComputePipelineDesc(denoiseLayout.get(), shader.get(), 8, 8, 1));
++            denoiseSets[0] = std::make_unique<HybridDenoiseDescriptorSet>(device);
++            denoiseSets[1] = std::make_unique<HybridDenoiseDescriptorSet>(device);
++        }
++
++        // Scene statistics used for detecting enclosed scenes.
++        {
++            HybridStatsDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            statsLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> shader = device->createShader(HYBRID_SHADER_BLOB(HybridRtStatsCS, shaderFormat), "CSMain", shaderFormat);
++            statsPipeline = device->createComputePipeline(RenderComputePipelineDesc(statsLayout.get(), shader.get(), 256, 1, 1));
++            statsSet = std::make_unique<HybridStatsDescriptorSet>(device);
++            statsBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(256, HybridUAVBufferFlags));
++            statsBuffer->setName("Hybrid RT Stats");
++            statsReset = true;
++        }
++
++        // Composite. The pipelines themselves depend on the target and are created on demand.
++        {
++            HybridCompositeDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            compositeLayout = layoutBuilder.create(device);
++
++            fullScreenVertexShader = device->createShader(HYBRID_SHADER_BLOB(FullScreenVS, shaderFormat), "VSMain", shaderFormat);
++            compositePixelShader = device->createShader(HYBRID_SHADER_BLOB(HybridRtCompositePS, shaderFormat), "PSMain", shaderFormat);
++            compositeSet = std::make_unique<HybridCompositeDescriptorSet>(device);
++        }
++
++        // Parameters shared by all the shaders.
++        paramsBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(roundUpSize(sizeof(interop::HybridRaytracingParams), 256), RenderBufferFlag::CONSTANT));
++#   endif
++    }
++
++    const HybridRaytracer::CompositePipelines &HybridRaytracer::getCompositePipelines(RenderFormat colorFormat, RenderFormat depthFormat, const RenderMultisampling &multisampling) {
++        const uint32_t sampleCount = multisampling.sampleCount;
++        for (const CompositePipelines &pipelines : compositePipelines) {
++            if ((pipelines.colorFormat == colorFormat) && (pipelines.depthFormat == depthFormat) && (pipelines.sampleCount == sampleCount)) {
++                return pipelines;
++            }
++        }
++
++        CompositePipelines pipelines;
++        pipelines.colorFormat = colorFormat;
++        pipelines.depthFormat = depthFormat;
++        pipelines.sampleCount = sampleCount;
++
++        RenderGraphicsPipelineDesc pipelineDesc;
++        pipelineDesc.pipelineLayout = compositeLayout.get();
++        pipelineDesc.vertexShader = fullScreenVertexShader.get();
++        pipelineDesc.pixelShader = compositePixelShader.get();
++        pipelineDesc.renderTargetFormat[0] = colorFormat;
++        pipelineDesc.renderTargetCount = 1;
++        pipelineDesc.depthTargetFormat = depthFormat;
++        pipelineDesc.depthEnabled = false;
++        pipelineDesc.depthWriteEnabled = false;
++        pipelineDesc.cullMode = RenderCullMode::NONE;
++        pipelineDesc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
++        pipelineDesc.multisampling = multisampling;
++
++        // Multiply the color already in the target by the output of the shader and leave the alpha untouched.
++        RenderBlendDesc &multiplyBlend = pipelineDesc.renderTargetBlend[0];
++        multiplyBlend.blendEnabled = true;
++        multiplyBlend.srcBlend = RenderBlend::DEST_COLOR;
++        multiplyBlend.dstBlend = RenderBlend::ZERO;
++        multiplyBlend.blendOp = RenderBlendOperation::ADD;
++        multiplyBlend.srcBlendAlpha = RenderBlend::ZERO;
++        multiplyBlend.dstBlendAlpha = RenderBlend::ONE;
++        multiplyBlend.blendOpAlpha = RenderBlendOperation::ADD;
++        pipelines.multiply = device->createGraphicsPipeline(pipelineDesc);
++
++        // Debug views replace the color.
++        RenderBlendDesc &replaceBlend = pipelineDesc.renderTargetBlend[0];
++        replaceBlend = RenderBlendDesc::Copy();
++        replaceBlend.srcBlendAlpha = RenderBlend::ZERO;
++        replaceBlend.dstBlendAlpha = RenderBlend::ONE;
++        replaceBlend.blendEnabled = true;
++        pipelines.replace = device->createGraphicsPipeline(pipelineDesc);
++
++        compositePipelines.emplace_back(std::move(pipelines));
++        return compositePipelines.back();
++    }
++
++    void HybridRaytracer::updateTextures(uint32_t width, uint32_t height) {
++        if ((textureWidth == width) && (textureHeight == height) && (depthTexture != nullptr)) {
++            return;
++        }
++
++        textureWidth = width;
++        textureHeight = height;
++        depthTexture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, HybridDepthFormat, HybridUAVTextureFlags));
++        depthTexture->setName("Hybrid RT Depth");
++        visibilityTexture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, HybridVisibilityFormat, HybridUAVTextureFlags));
++        visibilityTexture->setName("Hybrid RT Visibility");
++        visibilityTempTexture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, HybridVisibilityFormat, HybridUAVTextureFlags));
++        visibilityTempTexture->setName("Hybrid RT Visibility Temp");
++        visibilityFilteredTexture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, HybridVisibilityFormat, HybridUAVTextureFlags));
++        visibilityFilteredTexture->setName("Hybrid RT Visibility Filtered");
++        normalDepthTexture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, HybridNormalDepthFormat, HybridUAVTextureFlags));
++        normalDepthTexture->setName("Hybrid RT Normal Depth");
++    }
++
++    bool HybridRaytracer::prepare(const HybridRaytracingGeometry &geometry, const HybridRaytracingCamera &camera, uint32_t frameIndex) {
++        prepared = false;
++
++        if (!supported || !config.active() || (geometry.indexCount < 3) || (geometry.vertexCount == 0) || (geometry.indices == nullptr)) {
++            return false;
++        }
++
++        if ((geometry.positionBuffer == nullptr) || (geometry.velocityBuffer == nullptr) || (geometry.worldIndicesBuffer == nullptr) || (geometry.worldTransformsBuffer == nullptr)) {
++            return false;
++        }
++
++        // World space positions computed on the GPU.
++        const uint64_t requiredPositionSize = uint64_t(geometry.vertexCount) * sizeof(float) * 4;
++        if (worldPositionBufferSize < requiredPositionSize) {
++            worldPositionBufferSize = roundUpSize((requiredPositionSize * 3) / 2, 256);
++            worldPositionBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(worldPositionBufferSize, HybridUAVBufferFlags | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT));
++            worldPositionBuffer->setName("Hybrid RT World Positions");
++        }
++
++        // Triangle indices of the shadow casters uploaded from the CPU.
++        const uint32_t indexCount = geometry.indexCount - (geometry.indexCount % 3);
++        const uint64_t requiredIndexSize = uint64_t(indexCount) * sizeof(uint32_t);
++        if (indexBufferSize < requiredIndexSize) {
++            indexBufferSize = roundUpSize((requiredIndexSize * 3) / 2, 256);
++            indexBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(indexBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT));
++            indexBuffer->setName("Hybrid RT Indices");
++        }
++
++        void *indexBytes = indexBuffer->map();
++        memcpy(indexBytes, geometry.indices, requiredIndexSize);
++        indexBuffer->unmap();
++
++        // Bottom level acceleration structure with all the casters in world space.
++        const RenderBottomLevelASMesh mesh(indexBuffer->at(0), worldPositionBuffer->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, indexCount, geometry.vertexCount, sizeof(float) * 4, true);
++        device->setBottomLevelASBuildInfo(blasBuildInfo, &mesh, 1, true, false);
++
++        bool blasRecreated = false;
++        if (blasBufferSize < blasBuildInfo.accelerationStructureSize) {
++            blasBufferSize = roundUpSize((blasBuildInfo.accelerationStructureSize * 3) / 2, 256);
++            blasBuffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(blasBufferSize));
++            blasBuffer->setName("Hybrid RT BLAS");
++            blasRecreated = true;
++        }
++
++        if (blasRecreated || (blas == nullptr) || (blasSize < blasBuildInfo.accelerationStructureSize)) {
++            blasSize = blasBufferSize;
++            blas = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::BOTTOM_LEVEL, blasBuffer->at(0), blasSize));
++        }
++
++        if (blasScratchBufferSize < blasBuildInfo.scratchSize) {
++            blasScratchBufferSize = roundUpSize((blasBuildInfo.scratchSize * 3) / 2, 256);
++            blasScratchBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(blasScratchBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS));
++            blasScratchBuffer->setName("Hybrid RT BLAS Scratch");
++        }
++
++        // Top level acceleration structure with a single instance and an identity transform.
++        const RenderTopLevelASInstance instance(blasBuffer->at(0), 0, 0xFF, 0, true, RenderAffineTransform());
++        device->setTopLevelASBuildInfo(tlasBuildInfo, &instance, 1, true, false);
++
++        if (instancesBufferSize < tlasBuildInfo.instancesBufferData.size()) {
++            instancesBufferSize = roundUpSize(tlasBuildInfo.instancesBufferData.size(), 256);
++            instancesBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(instancesBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT));
++            instancesBuffer->setName("Hybrid RT TLAS Instances");
++        }
++
++        void *instanceBytes = instancesBuffer->map();
++        memcpy(instanceBytes, tlasBuildInfo.instancesBufferData.data(), tlasBuildInfo.instancesBufferData.size());
++        instancesBuffer->unmap();
++
++        bool tlasRecreated = false;
++        if (tlasBufferSize < tlasBuildInfo.accelerationStructureSize) {
++            tlasBufferSize = roundUpSize(tlasBuildInfo.accelerationStructureSize, 256);
++            tlasBuffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(tlasBufferSize));
++            tlasBuffer->setName("Hybrid RT TLAS");
++            tlasRecreated = true;
++        }
++
++        if (tlasRecreated || (tlas == nullptr) || (tlasSize < tlasBuildInfo.accelerationStructureSize)) {
++            tlasSize = tlasBufferSize;
++            tlas = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::TOP_LEVEL, tlasBuffer->at(0), tlasSize));
++        }
++
++        if (tlasScratchBufferSize < tlasBuildInfo.scratchSize) {
++            tlasScratchBufferSize = roundUpSize(tlasBuildInfo.scratchSize, 256);
++            tlasScratchBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(tlasScratchBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS));
++            tlasScratchBuffer->setName("Hybrid RT TLAS Scratch");
++        }
++
++        // World position compute shader inputs.
++        HybridWorldDescriptorSet *worldDescriptorSet = static_cast<HybridWorldDescriptorSet *>(worldSet.get());
++        worldDescriptorSet->setBuffer(worldDescriptorSet->srcPos, geometry.positionBuffer, geometry.positionView);
++        worldDescriptorSet->setBuffer(worldDescriptorSet->srcVel, geometry.velocityBuffer, geometry.velocityView);
++        worldDescriptorSet->setBuffer(worldDescriptorSet->srcIndices, geometry.worldIndicesBuffer, geometry.worldIndicesView);
++        worldDescriptorSet->setBuffer(worldDescriptorSet->worldMats, geometry.worldTransformsBuffer, RenderBufferStructuredView(sizeof(interop::float4x4)));
++        worldDescriptorSet->setBuffer(worldDescriptorSet->dstPos, worldPositionBuffer.get(), RenderBufferStructuredView(sizeof(float) * 4));
++        worldCB.vertexStart = 0;
++        worldCB.vertexCount = geometry.vertexCount;
++        worldCB.curFrameWeight = geometry.curFrameWeight;
++        worldCB.padding = 0;
++
++        // Parameters.
++        const hlslpp::float3 sunDirection = config.sunDirection();
++        const hlslpp::float3 cameraPosition = computeHybridCameraPosition(camera.viewProj);
++        params.pixelToWorld = computeHybridPixelToWorld(camera);
++        params.cameraPosition = hlslpp::float4(cameraPosition, 1.0f);
++        params.sunDirection = hlslpp::float4(sunDirection, 0.0f);
++        params.resolution = { 0, 0 };
++        params.frameIndex = frameIndex;
++        params.flags = 0;
++        params.flags |= config.shadows ? HYBRID_RT_FLAG_SHADOWS : 0;
++        params.flags |= (config.ambientOcclusion && (config.aoSamples > 0)) ? HYBRID_RT_FLAG_AMBIENT_OCCLUSION : 0;
++        params.flags |= config.temporalNoise ? HYBRID_RT_FLAG_TEMPORAL_NOISE : 0;
++        params.flags |= config.interiorDetection ? HYBRID_RT_FLAG_INTERIOR_DETECTION : 0;
++        params.aoSamples = uint32_t(config.aoSamples);
++        params.debugView = uint32_t(config.debugView);
++        params.denoiseRadius = uint32_t(config.denoiseRadius);
++        params.padding0 = 0;
++        params.aoRadius = config.aoRadius;
++        params.shadowMaxDistance = config.shadowMaxDistance;
++        params.sunAngularRadius = config.sunAngularRadiusDegrees * DegreesToRadians;
++        params.normalBias = config.normalBias;
++        params.shadowStrength = config.shadowStrength;
++        params.aoStrength = config.aoStrength;
++        params.nDotLStrength = config.nDotLStrength;
++        params.skyDepth = config.skyDepth;
++        params.denoiseDepthSigma = config.denoiseDepthSigma;
++        params.denoiseNormalPower = config.denoiseNormalPower;
++        params.interiorFadeStart = config.interiorFadeStart;
++        params.interiorFadeEnd = config.interiorFadeEnd;
++
++        prepared = true;
++        return true;
++    }
++
++    bool HybridRaytracer::isPrepared() const {
++        return prepared;
++    }
++
++    void HybridRaytracer::reset() {
++        prepared = false;
++    }
++
++    void HybridRaytracer::resetTemporalState() {
++        statsReset = true;
++    }
++
++    void HybridRaytracer::recordSetup(RenderCommandList *commandList) {
++        assert(commandList != nullptr);
++
++        if (!prepared) {
++            return;
++        }
++
++        // Compute the world space positions.
++        commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(worldPositionBuffer.get(), RenderBufferAccess::WRITE));
++        commandList->setPipeline(worldPipeline.get());
++        commandList->setComputePipelineLayout(worldLayout.get());
++        commandList->setComputePushConstants(0, &worldCB);
++        commandList->setComputeDescriptorSet(worldSet->get(), 0);
++        commandList->dispatch((worldCB.vertexCount + 63) / 64, 1, 1);
++        commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(worldPositionBuffer.get(), RenderBufferAccess::READ));
++
++        // Build the bottom level acceleration structure.
++        RenderBufferBarrier blasBuildBarriers[] = {
++            RenderBufferBarrier(blasBuffer.get(), RenderBufferAccess::WRITE),
++            RenderBufferBarrier(blasScratchBuffer.get(), RenderBufferAccess::WRITE)
++        };
++
++        commandList->barriers(RenderBarrierStage::COMPUTE, blasBuildBarriers, uint32_t(std::size(blasBuildBarriers)));
++        commandList->buildBottomLevelAS(blas.get(), blasScratchBuffer->at(0), blasBuildInfo);
++        commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(blasBuffer.get(), RenderBufferAccess::READ));
++
++        // Build the top level acceleration structure.
++        RenderBufferBarrier tlasBuildBarriers[] = {
++            RenderBufferBarrier(tlasBuffer.get(), RenderBufferAccess::WRITE),
++            RenderBufferBarrier(tlasScratchBuffer.get(), RenderBufferAccess::WRITE)
++        };
++
++        commandList->barriers(RenderBarrierStage::COMPUTE, tlasBuildBarriers, uint32_t(std::size(tlasBuildBarriers)));
++        commandList->buildTopLevelAS(tlas.get(), tlasScratchBuffer->at(0), instancesBuffer->at(0), tlasBuildInfo);
++        commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(tlasBuffer.get(), RenderBufferAccess::READ));
++    }
++
++    void HybridRaytracer::recordPass(RenderCommandList *commandList, const HybridRaytracingTarget &target) {
++        assert(commandList != nullptr);
++        assert(target.colorTexture != nullptr);
++        assert(target.depthTexture != nullptr);
++        assert(target.framebuffer != nullptr);
++
++        if (!prepared || (target.width == 0) || (target.height == 0)) {
++            return;
++        }
++
++        updateTextures(target.width, target.height);
++
++        // Upload the parameters now that the size of the region is known.
++        params.resolution = { target.width, target.height };
++        if (statsReset) {
++            params.flags |= HYBRID_RT_FLAG_RESET_STATS;
++            statsReset = false;
++        }
++        else {
++            params.flags &= ~HYBRID_RT_FLAG_RESET_STATS;
++        }
++
++        void *paramsBytes = paramsBuffer->map();
++        memcpy(paramsBytes, &params, sizeof(params));
++        paramsBuffer->unmap();
++
++        const uint64_t paramsSize = roundUpSize(sizeof(interop::HybridRaytracingParams), 256);
++        const bool useDenoiser = (config.denoiseRadius > 0);
++        RenderTexture *compositeInput = useDenoiser ? visibilityFilteredTexture.get() : visibilityTexture.get();
++
++        // Update all descriptor sets before any of them are bound.
++        HybridDepthCopyDescriptorSet *depthCopyDescriptorSet = static_cast<HybridDepthCopyDescriptorSet *>(depthCopySet.get());
++        depthCopyDescriptorSet->setTexture(depthCopyDescriptorSet->gInputDepth, target.depthTexture, RenderTextureLayout::DEPTH_READ, target.depthTextureView);
++        depthCopyDescriptorSet->setTexture(depthCopyDescriptorSet->gOutputDepth, depthTexture.get(), RenderTextureLayout::GENERAL);
++
++        HybridTraceDescriptorSet *traceDescriptorSet = static_cast<HybridTraceDescriptorSet *>(traceSet.get());
++        traceDescriptorSet->setBuffer(traceDescriptorSet->gParams, paramsBuffer.get(), paramsSize);
++        traceDescriptorSet->setAccelerationStructure(traceDescriptorSet->SceneBVH, tlas.get());
++        traceDescriptorSet->setTexture(traceDescriptorSet->gDepth, depthTexture.get(), RenderTextureLayout::SHADER_READ);
++        traceDescriptorSet->setTexture(traceDescriptorSet->gOutput, visibilityTexture.get(), RenderTextureLayout::GENERAL);
++        traceDescriptorSet->setTexture(traceDescriptorSet->gNormalDepth, normalDepthTexture.get(), RenderTextureLayout::GENERAL);
++
++        HybridDenoiseDescriptorSet *denoiseHorizontalSet = static_cast<HybridDenoiseDescriptorSet *>(denoiseSets[0].get());
++        denoiseHorizontalSet->setBuffer(denoiseHorizontalSet->gParams, paramsBuffer.get(), paramsSize);
++        denoiseHorizontalSet->setTexture(denoiseHorizontalSet->gInput, visibilityTexture.get(), RenderTextureLayout::SHADER_READ);
++        denoiseHorizontalSet->setTexture(denoiseHorizontalSet->gNormalDepth, normalDepthTexture.get(), RenderTextureLayout::SHADER_READ);
++        denoiseHorizontalSet->setTexture(denoiseHorizontalSet->gOutput, visibilityTempTexture.get(), RenderTextureLayout::GENERAL);
++        denoiseHorizontalSet->setTexture(denoiseHorizontalSet->gDepth, depthTexture.get(), RenderTextureLayout::SHADER_READ);
++
++        HybridDenoiseDescriptorSet *denoiseVerticalSet = static_cast<HybridDenoiseDescriptorSet *>(denoiseSets[1].get());
++        denoiseVerticalSet->setBuffer(denoiseVerticalSet->gParams, paramsBuffer.get(), paramsSize);
++        denoiseVerticalSet->setTexture(denoiseVerticalSet->gInput, visibilityTempTexture.get(), RenderTextureLayout::SHADER_READ);
++        denoiseVerticalSet->setTexture(denoiseVerticalSet->gNormalDepth, normalDepthTexture.get(), RenderTextureLayout::SHADER_READ);
++        denoiseVerticalSet->setTexture(denoiseVerticalSet->gOutput, visibilityFilteredTexture.get(), RenderTextureLayout::GENERAL);
++        denoiseVerticalSet->setTexture(denoiseVerticalSet->gDepth, depthTexture.get(), RenderTextureLayout::SHADER_READ);
++
++        HybridStatsDescriptorSet *statsDescriptorSet = static_cast<HybridStatsDescriptorSet *>(statsSet.get());
++        statsDescriptorSet->setBuffer(statsDescriptorSet->gParams, paramsBuffer.get(), paramsSize);
++        statsDescriptorSet->setTexture(statsDescriptorSet->gVisibility, visibilityTexture.get(), RenderTextureLayout::SHADER_READ);
++        statsDescriptorSet->setTexture(statsDescriptorSet->gNormalDepth, normalDepthTexture.get(), RenderTextureLayout::SHADER_READ);
++        statsDescriptorSet->setBuffer(statsDescriptorSet->gStats, statsBuffer.get(), RenderBufferStructuredView(sizeof(float) * 4));
++
++        HybridCompositeDescriptorSet *compositeDescriptorSet = static_cast<HybridCompositeDescriptorSet *>(compositeSet.get());
++        compositeDescriptorSet->setBuffer(compositeDescriptorSet->gParams, paramsBuffer.get(), paramsSize);
++        compositeDescriptorSet->setTexture(compositeDescriptorSet->gFiltered, compositeInput, RenderTextureLayout::SHADER_READ);
++        compositeDescriptorSet->setTexture(compositeDescriptorSet->gNormalDepth, normalDepthTexture.get(), RenderTextureLayout::SHADER_READ);
++        compositeDescriptorSet->setBuffer(compositeDescriptorSet->gStats, statsBuffer.get(), RenderBufferStructuredView(sizeof(float) * 4));
++
++        interop::HybridRaytracingDispatchCB dispatchCB;
++        dispatchCB.resolution = { target.width, target.height };
++        dispatchCB.direction = { 0, 0 };
++        const uint32_t groupsX = (target.width + 7) / 8;
++        const uint32_t groupsY = (target.height + 7) / 8;
++
++        // Leave the render pass and copy the depth buffer into a single sampled texture.
++        commandList->setFramebuffer(nullptr);
++
++        RenderTextureBarrier depthCopyBarriers[] = {
++            RenderTextureBarrier(target.depthTexture, RenderTextureLayout::DEPTH_READ),
++            RenderTextureBarrier(depthTexture.get(), RenderTextureLayout::GENERAL)
++        };
++
++        commandList->barriers(RenderBarrierStage::COMPUTE, depthCopyBarriers, uint32_t(std::size(depthCopyBarriers)));
++        const bool multisampled = (target.multisampling.sampleCount > 1);
++        commandList->setPipeline(multisampled ? depthCopyMSPipeline.get() : depthCopyPipeline.get());
++        commandList->setComputePipelineLayout(depthCopyLayout.get());
++        commandList->setComputePushConstants(0, &dispatchCB);
++        commandList->setComputeDescriptorSet(depthCopySet->get(), 0);
++        commandList->dispatch(groupsX, groupsY, 1);
++
++        // Trace the rays.
++        RenderTextureBarrier traceBarriers[] = {
++            RenderTextureBarrier(depthTexture.get(), RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(visibilityTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(normalDepthTexture.get(), RenderTextureLayout::GENERAL)
++        };
++
++        commandList->barriers(RenderBarrierStage::COMPUTE, traceBarriers, uint32_t(std::size(traceBarriers)));
++        commandList->setPipeline(tracePipeline.get());
++        if (traceGlobalLayout != nullptr) {
++            // D3D12: the descriptors are provided through the local root arguments in the shader binding table.
++            commandList->setRaytracingPipelineLayout(traceGlobalLayout.get());
++        }
++        else {
++            commandList->setRaytracingPipelineLayout(traceLayout.get());
++            commandList->setRaytracingDescriptorSet(traceSet->get(), 0);
++        }
++
++        commandList->traceRays(target.width, target.height, 1, shaderBindingTableBuffer->at(0), shaderBindingTableInfo.groups);
++
++        // Filter the results.
++        RenderTextureBarrier filterInputBarriers[] = {
++            RenderTextureBarrier(visibilityTexture.get(), RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(normalDepthTexture.get(), RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(visibilityTempTexture.get(), RenderTextureLayout::GENERAL)
++        };
++
++        commandList->barriers(RenderBarrierStage::COMPUTE, filterInputBarriers, uint32_t(std::size(filterInputBarriers)));
++
++        // Measure the sun visibility of the scene.
++        commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::WRITE));
++        commandList->setPipeline(statsPipeline.get());
++        commandList->setComputePipelineLayout(statsLayout.get());
++        commandList->setComputeDescriptorSet(statsSet->get(), 0);
++        commandList->dispatch(1, 1, 1);
++        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::READ));
++
++        if (useDenoiser) {
++            commandList->setPipeline(denoisePipeline.get());
++            commandList->setComputePipelineLayout(denoiseLayout.get());
++
++            dispatchCB.direction = { 1, 0 };
++            commandList->setComputePushConstants(0, &dispatchCB);
++            commandList->setComputeDescriptorSet(denoiseSets[0]->get(), 0);
++            commandList->dispatch(groupsX, groupsY, 1);
++
++            RenderTextureBarrier verticalBarriers[] = {
++                RenderTextureBarrier(visibilityTempTexture.get(), RenderTextureLayout::SHADER_READ),
++                RenderTextureBarrier(visibilityFilteredTexture.get(), RenderTextureLayout::GENERAL)
++            };
++
++            commandList->barriers(RenderBarrierStage::COMPUTE, verticalBarriers, uint32_t(std::size(verticalBarriers)));
++
++            dispatchCB.direction = { 0, 1 };
++            commandList->setComputePushConstants(0, &dispatchCB);
++            commandList->setComputeDescriptorSet(denoiseSets[1]->get(), 0);
++            commandList->dispatch(groupsX, groupsY, 1);
++        }
++
++        // Composite on top of the color target.
++        RenderTextureBarrier compositeBarriers[] = {
++            RenderTextureBarrier(compositeInput, RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(normalDepthTexture.get(), RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(target.colorTexture, RenderTextureLayout::COLOR_WRITE),
++            RenderTextureBarrier(target.depthTexture, RenderTextureLayout::DEPTH_READ)
++        };
++
++        commandList->barriers(RenderBarrierStage::GRAPHICS, compositeBarriers, uint32_t(std::size(compositeBarriers)));
++
++        const CompositePipelines &pipelines = getCompositePipelines(target.colorFormat, target.depthFormat, target.multisampling);
++        const bool debugView = (config.debugView != HybridRaytracingConfiguration::DebugView::None);
++        const RenderViewport viewport(0.0f, 0.0f, float(target.width), float(target.height));
++        const RenderRect scissor(0, 0, int32_t(target.width), int32_t(target.height));
++        commandList->setFramebuffer(target.framebuffer);
++        commandList->setViewports(viewport);
++        commandList->setScissors(scissor);
++        commandList->setPipeline(debugView ? pipelines.replace.get() : pipelines.multiply.get());
++        commandList->setGraphicsPipelineLayout(compositeLayout.get());
++        commandList->setGraphicsDescriptorSet(compositeSet->get(), 0);
++        commandList->setVertexBuffers(0, nullptr, 0, nullptr);
++        commandList->drawInstanced(3, 1, 0, 0);
++    }
++};
+diff --git a/src/render/rt64_hybrid_raytracing.h b/src/render/rt64_hybrid_raytracing.h
+new file mode 100644
+index 0000000..94378db
+--- /dev/null
++++ b/src/render/rt64_hybrid_raytracing.h
+@@ -0,0 +1,272 @@
++//
++// RT64
++//
++// Hybrid ray tracing: ray traced sun shadows and ambient occlusion layered on top of the rasterized N64 image.
++//
++// The renderer keeps rasterizing the game exactly as before. After the 3D scene of the main framebuffer has been
++// drawn (and before the HUD), the depth buffer is used to reconstruct the world position of every pixel, rays are
++// traced against an acceleration structure built from the world space geometry of the frame and the filtered
++// visibility is multiplied on top of the image.
++//
++// This class only depends on plume so it can be driven by the framebuffer renderer as well as standalone tests.
++//
++
++#pragma once
++
++#include <filesystem>
++#include <memory>
++#include <vector>
++
++#include <json/json.hpp>
++
++#include "common/rt64_plume.h"
++#include "shared/rt64_hybrid_raytracing_params.h"
++#include "shared/rt64_rsp_viewport.h"
++
++namespace RT64 {
++    struct HybridRaytracingConfiguration {
++        enum class DebugView {
++            None,
++            Shadows,
++            AmbientOcclusion,
++            Combined,
++            Normals,
++            OptionCount
++        };
++
++        bool enabled = true;
++        bool shadows = true;
++        bool ambientOcclusion = true;
++
++        // Sun direction in the game's world space (Y is up). Azimuth rotates around the Y axis. The game has no
++        // single light direction, so the default is a high sun that keeps most of Spiral Mountain lit.
++        float sunAzimuthDegrees = 215.0f;
++        float sunElevationDegrees = 60.0f;
++
++        // Angular radius of the sun disk. Larger values produce softer shadows.
++        float sunAngularRadiusDegrees = 1.0f;
++
++        // How much the sun visibility darkens the image (0 = none, 1 = fully black shadows).
++        float shadowStrength = 0.6f;
++
++        // How much surfaces facing away from the sun are darkened. Most of the game's geometry has baked vertex
++        // lighting already, so this is kept moderate by default.
++        float nDotLStrength = 0.35f;
++
++        // Maximum distance a shadow ray can travel in game units.
++        float shadowMaxDistance = 20000.0f;
++
++        // Ambient occlusion.
++        int aoSamples = 2;
++        float aoRadius = 120.0f;
++        float aoStrength = 0.6f;
++
++        // Offset applied to ray origins along the reconstructed normal, in game units.
++        float normalBias = 2.0f;
++
++        // Depth buffer values at or above this threshold are considered to be the cleared background (sky).
++        float skyDepth = 0.99999f;
++
++        // Joint bilateral filter. A radius of 0 disables the filter. The depth sigma is the tolerated distance to the
++        // surface's plane relative to the distance to the camera.
++        int denoiseRadius = 6;
++        float denoiseDepthSigma = 0.02f;
++        float denoiseNormalPower = 8.0f;
++
++        // Fade out sun shadows when the sun is blocked almost everywhere on screen (e.g. inside a house). The fade happens
++        // between these two values of the average sun visibility of the visible geometry.
++        bool interiorDetection = true;
++        float interiorFadeStart = 0.08f;
++        float interiorFadeEnd = 0.25f;
++
++        // Include draw calls that use alpha compare (cutouts like fences and foliage) as shadow casters. They're
++        // treated as fully opaque since the acceleration structure has no texture information.
++        bool alphaTestedCasters = false;
++
++        // Vary the noise pattern each frame. Stable noise is used by default as there's no temporal accumulation.
++        bool temporalNoise = false;
++
++        DebugView debugView = DebugView::None;
++
++        hlslpp::float3 sunDirection() const;
++        void validate();
++        bool active() const;
++
++        // Path used when loading and saving the configuration. The RT64_HYBRID_RT_CONFIG environment
++        // variable overrides it. Otherwise "rt64_hybrid_rt.json" in the working directory is used.
++        static std::filesystem::path defaultPath();
++        bool load(const std::filesystem::path &path);
++        bool save(const std::filesystem::path &path) const;
++    };
++
++    void to_json(nlohmann::json &j, const HybridRaytracingConfiguration &cfg);
++    void from_json(const nlohmann::json &j, HybridRaytracingConfiguration &cfg);
++
++    // Describes the camera and the chain of viewport transformations used by the rasterizer for the scene.
++    struct HybridRaytracingCamera {
++        // World to clip space transform as used by the RSP (row vector convention, same as RT64's transforms).
++        hlslpp::float4x4 viewProj;
++
++        // N64 viewport transform (in native framebuffer pixels).
++        interop::RSPViewport viewport;
++
++        // Native framebuffer resolution used by the raster vertex shader to convert screen coordinates to NDC.
++        hlslpp::float2 fbResolution;
++
++        // Screen scale and offset applied by the raster vertex shader after the conversion to NDC.
++        hlslpp::float2 screenScale;
++        hlslpp::float2 screenOffset;
++
++        // Size of the render viewport in target pixels.
++        float targetWidth = 0.0f;
++        float targetHeight = 0.0f;
++    };
++
++    // Computes the matrix that converts (pixelX, pixelY, depth, 1) in the target into homogeneous world space.
++    hlslpp::float4x4 computeHybridPixelToWorld(const HybridRaytracingCamera &camera);
++
++    struct HybridRaytracingGeometry {
++        // Vertex inputs of the workload, as used by RSPWorldCS.
++        const RenderBuffer *positionBuffer = nullptr;
++        const RenderBufferFormattedView *positionView = nullptr;
++        const RenderBuffer *velocityBuffer = nullptr;
++        const RenderBufferFormattedView *velocityView = nullptr;
++        const RenderBuffer *worldIndicesBuffer = nullptr;
++        const RenderBufferFormattedView *worldIndicesView = nullptr;
++        const RenderBuffer *worldTransformsBuffer = nullptr;
++        uint32_t vertexCount = 0;
++        float curFrameWeight = 1.0f;
++
++        // Triangle list of the shadow casters using global vertex indices.
++        const uint32_t *indices = nullptr;
++        uint32_t indexCount = 0;
++    };
++
++    struct HybridRaytracingTarget {
++        RenderTexture *colorTexture = nullptr;
++        RenderTexture *depthTexture = nullptr;
++        const RenderTextureView *depthTextureView = nullptr;
++
++        // Framebuffer with the color target writable and the depth target read-only.
++        const RenderFramebuffer *framebuffer = nullptr;
++        RenderFormat colorFormat = RenderFormat::UNKNOWN;
++        RenderFormat depthFormat = RenderFormat::UNKNOWN;
++        RenderMultisampling multisampling;
++
++        // Size of the region to process, starting at the origin of the target.
++        uint32_t width = 0;
++        uint32_t height = 0;
++    };
++
++    struct HybridRaytracer {
++        HybridRaytracer(RenderDevice *device, RenderShaderFormat shaderFormat);
++        ~HybridRaytracer();
++
++        // Whether the device supports the ray tracing pipeline required by this pass.
++        bool isSupported() const;
++
++        void setConfiguration(const HybridRaytracingConfiguration &config);
++        const HybridRaytracingConfiguration &getConfiguration() const;
++
++        // Uploads the geometry and parameters for this frame. Must be called before recording the command list.
++        // Returns whether there's anything to trace this frame.
++        bool prepare(const HybridRaytracingGeometry &geometry, const HybridRaytracingCamera &camera, uint32_t frameIndex);
++        bool isPrepared() const;
++        void reset();
++
++        // Discards the values accumulated over previous frames (e.g. the smoothed sun visibility used for interior detection).
++        void resetTemporalState();
++
++        // Computes the world space vertices and builds the acceleration structures.
++        void recordSetup(RenderCommandList *commandList);
++
++        // Traces, filters and composites the result into the target. When this function returns, the target's framebuffer
++        // is bound, the color texture is in COLOR_WRITE and the depth texture is in DEPTH_READ.
++        void recordPass(RenderCommandList *commandList, const HybridRaytracingTarget &target);
++
++    private:
++        struct CompositePipelines {
++            RenderFormat colorFormat = RenderFormat::UNKNOWN;
++            RenderFormat depthFormat = RenderFormat::UNKNOWN;
++            uint32_t sampleCount = 0;
++            std::unique_ptr<RenderPipeline> multiply;
++            std::unique_ptr<RenderPipeline> replace;
++        };
++
++        RenderDevice *device = nullptr;
++        RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
++        bool supported = false;
++        bool prepared = false;
++        HybridRaytracingConfiguration config;
++        interop::HybridRaytracingParams params;
++        interop::HybridRaytracingWorldCB worldCB;
++
++        // Pipelines.
++        std::unique_ptr<RenderPipelineLayout> worldLayout;
++        std::unique_ptr<RenderPipeline> worldPipeline;
++        std::unique_ptr<RenderPipelineLayout> depthCopyLayout;
++        std::unique_ptr<RenderPipeline> depthCopyPipeline;
++        std::unique_ptr<RenderPipeline> depthCopyMSPipeline;
++        std::unique_ptr<RenderPipelineLayout> traceLayout;
++        std::unique_ptr<RenderPipelineLayout> traceGlobalLayout;
++        std::unique_ptr<RenderPipeline> tracePipeline;
++        std::unique_ptr<RenderPipelineLayout> denoiseLayout;
++        std::unique_ptr<RenderPipeline> denoisePipeline;
++        std::unique_ptr<RenderPipelineLayout> statsLayout;
++        std::unique_ptr<RenderPipeline> statsPipeline;
++        std::unique_ptr<RenderPipelineLayout> compositeLayout;
++        std::unique_ptr<RenderShader> fullScreenVertexShader;
++        std::unique_ptr<RenderShader> compositePixelShader;
++        std::vector<CompositePipelines> compositePipelines;
++
++        // Descriptor sets.
++        std::unique_ptr<RenderDescriptorSetBase> worldSet;
++        std::unique_ptr<RenderDescriptorSetBase> depthCopySet;
++        std::unique_ptr<RenderDescriptorSetBase> traceSet;
++        std::unique_ptr<RenderDescriptorSetBase> denoiseSets[2];
++        std::unique_ptr<RenderDescriptorSetBase> statsSet;
++        std::unique_ptr<RenderDescriptorSetBase> compositeSet;
++
++        // Shader binding table.
++        RenderShaderBindingTableInfo shaderBindingTableInfo;
++        std::unique_ptr<RenderBuffer> shaderBindingTableBuffer;
++
++        // Geometry and acceleration structures.
++        std::unique_ptr<RenderBuffer> worldPositionBuffer;
++        uint64_t worldPositionBufferSize = 0;
++        std::unique_ptr<RenderBuffer> indexBuffer;
++        uint64_t indexBufferSize = 0;
++        RenderBottomLevelASBuildInfo blasBuildInfo;
++        std::unique_ptr<RenderBuffer> blasBuffer;
++        uint64_t blasBufferSize = 0;
++        std::unique_ptr<RenderAccelerationStructure> blas;
++        uint64_t blasSize = 0;
++        std::unique_ptr<RenderBuffer> blasScratchBuffer;
++        uint64_t blasScratchBufferSize = 0;
++        RenderTopLevelASBuildInfo tlasBuildInfo;
++        std::unique_ptr<RenderBuffer> tlasBuffer;
++        uint64_t tlasBufferSize = 0;
++        std::unique_ptr<RenderAccelerationStructure> tlas;
++        uint64_t tlasSize = 0;
++        std::unique_ptr<RenderBuffer> tlasScratchBuffer;
++        uint64_t tlasScratchBufferSize = 0;
++        std::unique_ptr<RenderBuffer> instancesBuffer;
++        uint64_t instancesBufferSize = 0;
++        std::unique_ptr<RenderBuffer> paramsBuffer;
++        std::unique_ptr<RenderBuffer> statsBuffer;
++        bool statsReset = true;
++
++        // Screen space resources.
++        uint32_t textureWidth = 0;
++        uint32_t textureHeight = 0;
++        std::unique_ptr<RenderTexture> depthTexture;
++        std::unique_ptr<RenderTexture> visibilityTexture;
++        std::unique_ptr<RenderTexture> visibilityTempTexture;
++        std::unique_ptr<RenderTexture> visibilityFilteredTexture;
++        std::unique_ptr<RenderTexture> normalDepthTexture;
++
++        void createPipelines();
++        void updateTextures(uint32_t width, uint32_t height);
++        const CompositePipelines &getCompositePipelines(RenderFormat colorFormat, RenderFormat depthFormat, const RenderMultisampling &multisampling);
++    };
++};
+diff --git a/src/shaders/HybridRtCompositePS.hlsl b/src/shaders/HybridRtCompositePS.hlsl
+new file mode 100644
+index 0000000..8f5576c
+--- /dev/null
++++ b/src/shaders/HybridRtCompositePS.hlsl
+@@ -0,0 +1,48 @@
++//
++// RT64
++//
++// Applies the filtered hybrid ray traced visibility on top of the rasterized scene.
++//
++// In the regular mode the output is a lighting factor that is multiplied with the render target through the blend
++// state (dst * src), so the original colors, alpha and coverage written by the N64 blender emulation are preserved.
++// The debug views replace the color instead to visualize the intermediate results.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++ConstantBuffer<HybridRaytracingParams> gParams : register(b1);
++Texture2D<float2> gFiltered : register(t2);
++Texture2D<float4> gNormalDepth : register(t3);
++StructuredBuffer<float4> gStats : register(t4);
++
++float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
++    const uint2 pixel = uint2(pos.xy);
++    if (any(pixel >= gParams.resolution)) {
++        return float4(1.0f, 1.0f, 1.0f, 1.0f);
++    }
++
++    const float2 visibility = gFiltered.Load(uint3(pixel, 0));
++    // Fade out the sun shadows in enclosed scenes, where the sun is blocked almost everywhere.
++    float sunFade = 1.0f;
++    if (gParams.flags & HYBRID_RT_FLAG_INTERIOR_DETECTION) {
++        sunFade = smoothstep(gParams.interiorFadeStart, gParams.interiorFadeEnd, gStats[0].x);
++    }
++
++    const float sunFactor = (gParams.flags & HYBRID_RT_FLAG_SHADOWS) ? lerp(1.0f, visibility.x, gParams.shadowStrength * sunFade) : 1.0f;
++    const float ambientFactor = (gParams.flags & HYBRID_RT_FLAG_AMBIENT_OCCLUSION) ? lerp(1.0f, visibility.y, gParams.aoStrength) : 1.0f;
++    switch (gParams.debugView) {
++    case HYBRID_RT_DEBUG_SHADOWS:
++        return float4(visibility.xxx, 1.0f);
++    case HYBRID_RT_DEBUG_AMBIENT_OCCLUSION:
++        return float4(visibility.yyy, 1.0f);
++    case HYBRID_RT_DEBUG_COMBINED:
++        return float4((sunFactor * ambientFactor).xxx, 1.0f);
++    case HYBRID_RT_DEBUG_NORMALS: {
++        const float4 normalDepth = gNormalDepth.Load(uint3(pixel, 0));
++        return float4((normalDepth.w < 0.0f) ? float3(0.0f, 0.0f, 0.0f) : (normalDepth.xyz * 0.5f + 0.5f), 1.0f);
++    }
++    case HYBRID_RT_DEBUG_NONE:
++    default:
++        return float4((sunFactor * ambientFactor).xxx, 1.0f);
++    }
++}
+diff --git a/src/shaders/HybridRtDenoiseCS.hlsl b/src/shaders/HybridRtDenoiseCS.hlsl
+new file mode 100644
+index 0000000..3c9630f
+--- /dev/null
++++ b/src/shaders/HybridRtDenoiseCS.hlsl
+@@ -0,0 +1,69 @@
++//
++// RT64
++//
++// Separable joint bilateral filter for the hybrid ray traced visibility terms. The weights use the reconstructed
++// normal and the distance of each sample to the plane of the center pixel's surface, so shadows and occlusion don't
++// bleed across geometric edges while surfaces seen at grazing angles (like the ground) are still filtered properly.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++[[vk::push_constant]] ConstantBuffer<HybridRaytracingDispatchCB> gConstants : register(b0);
++ConstantBuffer<HybridRaytracingParams> gParams : register(b1);
++Texture2D<float2> gInput : register(t2);
++Texture2D<float4> gNormalDepth : register(t3);
++[[vk::image_format("rg16f")]] RWTexture2D<float2> gOutput : register(u4);
++Texture2D<float> gDepth : register(t5);
++
++float3 reconstructPosition(int2 pixel) {
++    const float depth = gDepth.Load(int3(pixel, 0));
++    const float4 h = mul(gParams.pixelToWorld, float4(float2(pixel) + 0.5f, depth, 1.0f));
++    return h.xyz / h.w;
++}
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 coord : SV_DispatchThreadID) {
++    if (any(coord >= gConstants.resolution)) {
++        return;
++    }
++
++    const float4 centerNormalDepth = gNormalDepth.Load(uint3(coord, 0));
++    const float2 centerValue = gInput.Load(uint3(coord, 0));
++    if (centerNormalDepth.w < 0.0f) {
++        gOutput[coord] = centerValue;
++        return;
++    }
++
++    const int radius = int(gParams.denoiseRadius);
++    const int2 direction = int2(gConstants.direction);
++    const float sigmaSpatial = max(float(radius) * 0.5f, 1.0f);
++    const float planeTolerance = max(gParams.denoiseDepthSigma * centerNormalDepth.w, 1e-3f);
++    const float3 centerPosition = reconstructPosition(int2(coord));
++    float2 valueSum = centerValue;
++    float weightSum = 1.0f;
++    for (int i = -radius; i <= radius; i++) {
++        if (i == 0) {
++            continue;
++        }
++
++        const int2 samplePos = int2(coord) + direction * i;
++        if (any(samplePos < 0) || any(samplePos >= int2(gConstants.resolution))) {
++            continue;
++        }
++
++        const float4 sampleNormalDepth = gNormalDepth.Load(int3(samplePos, 0));
++        if (sampleNormalDepth.w < 0.0f) {
++            continue;
++        }
++
++        const float spatialWeight = exp(-float(i * i) / (2.0f * sigmaSpatial * sigmaSpatial));
++        const float planeDistance = abs(dot(centerNormalDepth.xyz, reconstructPosition(samplePos) - centerPosition));
++        const float depthWeight = exp(-planeDistance / planeTolerance);
++        const float normalWeight = pow(saturate(dot(sampleNormalDepth.xyz, centerNormalDepth.xyz)), gParams.denoiseNormalPower);
++        const float weight = spatialWeight * depthWeight * normalWeight;
++        valueSum += gInput.Load(int3(samplePos, 0)) * weight;
++        weightSum += weight;
++    }
++
++    gOutput[coord] = valueSum / weightSum;
++}
+diff --git a/src/shaders/HybridRtDepthCopyCS.hlsl b/src/shaders/HybridRtDepthCopyCS.hlsl
+new file mode 100644
+index 0000000..edd4e5b
+--- /dev/null
++++ b/src/shaders/HybridRtDepthCopyCS.hlsl
+@@ -0,0 +1,31 @@
++//
++// RT64
++//
++// Copies the scene's depth buffer into a single sampled R32 texture that the ray generation shader can read.
++// Multisampled depth buffers use the first sample, which matches the pixel center used for reconstruction.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++[[vk::push_constant]] ConstantBuffer<HybridRaytracingDispatchCB> gConstants : register(b0);
++
++#if defined(MULTISAMPLING)
++Texture2DMS<float> gInputDepth : register(t1);
++#else
++Texture2D<float> gInputDepth : register(t1);
++#endif
++
++RWTexture2D<float> gOutputDepth : register(u2);
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 coord : SV_DispatchThreadID) {
++    if (any(coord >= gConstants.resolution)) {
++        return;
++    }
++
++#if defined(MULTISAMPLING)
++    gOutputDepth[coord] = gInputDepth.Load(coord, 0);
++#else
++    gOutputDepth[coord] = gInputDepth.Load(uint3(coord, 0));
++#endif
++}
+diff --git a/src/shaders/HybridRtStatsCS.hlsl b/src/shaders/HybridRtStatsCS.hlsl
+new file mode 100644
+index 0000000..f1de360
+--- /dev/null
++++ b/src/shaders/HybridRtStatsCS.hlsl
+@@ -0,0 +1,59 @@
++//
++// RT64
++//
++// Measures how much of the visible geometry can see the sun. Enclosed scenes (like the interior of a house) block the
++// sun everywhere, which would darken the entire image uniformly. The measured value is smoothed over time and used by
++// the composite to fade out sun shadows in those scenes while keeping the ambient occlusion.
++//
++// Runs as a single thread group over a sparse grid of pixels so it stays cheap at any resolution.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++#define GROUP_SIZE 256
++#define SAMPLE_STRIDE 4
++
++ConstantBuffer<HybridRaytracingParams> gParams : register(b1);
++Texture2D<float2> gVisibility : register(t2);
++Texture2D<float4> gNormalDepth : register(t3);
++RWStructuredBuffer<float4> gStats : register(u4);
++
++groupshared float sharedVisibility[GROUP_SIZE];
++groupshared float sharedCount[GROUP_SIZE];
++
++[numthreads(GROUP_SIZE, 1, 1)]
++void CSMain(uint threadIndex : SV_GroupIndex) {
++    const uint2 gridSize = (gParams.resolution + SAMPLE_STRIDE - 1) / SAMPLE_STRIDE;
++    const uint gridCount = gridSize.x * gridSize.y;
++    float visibilitySum = 0.0f;
++    float count = 0.0f;
++    for (uint i = threadIndex; i < gridCount; i += GROUP_SIZE) {
++        const uint2 pixel = min(uint2(i % gridSize.x, i / gridSize.x) * SAMPLE_STRIDE, gParams.resolution - 1);
++        if (gNormalDepth.Load(uint3(pixel, 0)).w >= 0.0f) {
++            visibilitySum += gVisibility.Load(uint3(pixel, 0)).x;
++            count += 1.0f;
++        }
++    }
++
++    sharedVisibility[threadIndex] = visibilitySum;
++    sharedCount[threadIndex] = count;
++    GroupMemoryBarrierWithGroupSync();
++
++    for (uint stride = GROUP_SIZE / 2; stride > 0; stride /= 2) {
++        if (threadIndex < stride) {
++            sharedVisibility[threadIndex] += sharedVisibility[threadIndex + stride];
++            sharedCount[threadIndex] += sharedCount[threadIndex + stride];
++        }
++
++        GroupMemoryBarrierWithGroupSync();
++    }
++
++    if (threadIndex == 0) {
++        // Scenes without any geometry are treated as outdoors.
++        const float averageVisibility = (sharedCount[0] > 0.0f) ? (sharedVisibility[0] / sharedCount[0]) : 1.0f;
++        const float4 previous = gStats[0];
++        const bool reset = (gParams.flags & HYBRID_RT_FLAG_RESET_STATS) || (previous.y < 0.5f);
++        const float smoothedVisibility = reset ? averageVisibility : lerp(previous.x, averageVisibility, 0.15f);
++        gStats[0] = float4(smoothedVisibility, 1.0f, averageVisibility, sharedCount[0]);
++    }
++}
+diff --git a/src/shaders/HybridRtTraceRT.hlsl b/src/shaders/HybridRtTraceRT.hlsl
+new file mode 100644
+index 0000000..9f92f19
+--- /dev/null
++++ b/src/shaders/HybridRtTraceRT.hlsl
+@@ -0,0 +1,211 @@
++//
++// RT64
++//
++// Hybrid ray traced sun shadows and ambient occlusion.
++//
++// The rasterized scene is left untouched. For every pixel of the scene's depth buffer, the world space
++// position is reconstructed with the camera that rasterized it, a geometric normal is derived from the
++// neighboring depth values and rays are traced against an acceleration structure built from the world
++// space geometry of the frame. The result is written as (sun visibility, ambient visibility) and is
++// later filtered and multiplied on top of the rasterized image before the HUD is drawn.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++ConstantBuffer<HybridRaytracingParams> gParams : register(b0, space0);
++RaytracingAccelerationStructure SceneBVH : register(t1, space0);
++Texture2D<float> gDepth : register(t2, space0);
++[[vk::image_format("rg16f")]] RWTexture2D<float2> gOutput : register(u3, space0);
++[[vk::image_format("rgba16f")]] RWTexture2D<float4> gNormalDepth : register(u4, space0);
++
++struct OcclusionPayload {
++    // 0 or more: distance to the closest hit (or 0 when the closest hit shader is skipped).
++    // Negative: the ray didn't hit anything.
++    float hitT;
++};
++
++static const float Pi = 3.14159265f;
++
++uint hashUint(uint x) {
++    // PCG hash.
++    uint state = x * 747796405u + 2891336453u;
++    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
++    return (word >> 22u) ^ word;
++}
++
++float uintToUnitFloat(uint x) {
++    return float(x >> 8) * (1.0f / 16777216.0f);
++}
++
++// Low discrepancy per-pixel values. Unlike white noise, these patterns are removed efficiently by the spatial filter.
++float interleavedGradientNoise(float2 pixel) {
++    return frac(52.9829189f * frac(dot(pixel, float2(0.06711056f, 0.00583715f))));
++}
++
++float r2PixelNoise(float2 pixel) {
++    return frac(0.5f + dot(pixel, float2(0.7548776662f, 0.5698402910f)));
++}
++
++void buildBasis(float3 n, out float3 t, out float3 b) {
++    // Branchless orthonormal basis (Duff et al. 2017).
++    const float s = (n.z >= 0.0f) ? 1.0f : -1.0f;
++    const float a = -1.0f / (s + n.z);
++    const float c = n.x * n.y * a;
++    t = float3(1.0f + s * n.x * n.x * a, s * c, -s * n.x);
++    b = float3(c, s + n.y * n.y * a, -n.y);
++}
++
++float3 sampleCosineHemisphere(float3 n, float2 u) {
++    float3 t, b;
++    buildBasis(n, t, b);
++    const float r = sqrt(u.x);
++    const float phi = 2.0f * Pi * u.y;
++    const float3 local = float3(r * cos(phi), r * sin(phi), sqrt(max(0.0f, 1.0f - u.x)));
++    return normalize(t * local.x + b * local.y + n * local.z);
++}
++
++float3 sampleCone(float3 dir, float cosThetaMax, float2 u) {
++    float3 t, b;
++    buildBasis(dir, t, b);
++    const float cosTheta = lerp(1.0f, cosThetaMax, u.x);
++    const float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
++    const float phi = 2.0f * Pi * u.y;
++    return normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + dir * cosTheta);
++}
++
++bool isSkyDepth(float depth) {
++    return depth >= gParams.skyDepth;
++}
++
++float3 reconstructPosition(int2 pixel, float depth) {
++    const float4 h = mul(gParams.pixelToWorld, float4(float2(pixel) + 0.5f, depth, 1.0f));
++    return h.xyz / h.w;
++}
++
++bool loadPosition(int2 pixel, out float3 position) {
++    const int2 clamped = clamp(pixel, int2(0, 0), int2(gParams.resolution) - 1);
++    const float depth = gDepth.Load(int3(clamped, 0));
++    position = reconstructPosition(clamped, depth);
++    return !isSkyDepth(depth) && all(clamped == pixel);
++}
++
++float3 reconstructNormal(int2 pixel, float3 position, float3 cameraPosition) {
++    // Pick the neighbor with the smallest change in distance on each axis to avoid smearing normals across edges.
++    const float centerDistance = distance(position, cameraPosition);
++    float3 left, right, up, down;
++    const bool leftValid = loadPosition(pixel + int2(-1, 0), left);
++    const bool rightValid = loadPosition(pixel + int2(1, 0), right);
++    const bool upValid = loadPosition(pixel + int2(0, -1), up);
++    const bool downValid = loadPosition(pixel + int2(0, 1), down);
++    const float leftDelta = leftValid ? abs(distance(left, cameraPosition) - centerDistance) : 1e30f;
++    const float rightDelta = rightValid ? abs(distance(right, cameraPosition) - centerDistance) : 1e30f;
++    const float upDelta = upValid ? abs(distance(up, cameraPosition) - centerDistance) : 1e30f;
++    const float downDelta = downValid ? abs(distance(down, cameraPosition) - centerDistance) : 1e30f;
++    const float3 viewDirection = normalize(cameraPosition - position);
++    if ((!leftValid && !rightValid) || (!upValid && !downValid)) {
++        return viewDirection;
++    }
++
++    const float3 dx = (rightDelta < leftDelta) ? (right - position) : (position - left);
++    const float3 dy = (downDelta < upDelta) ? (down - position) : (position - up);
++    float3 normal = cross(dy, dx);
++    const float normalLength = length(normal);
++    if (normalLength < 1e-12f) {
++        return viewDirection;
++    }
++
++    normal /= normalLength;
++    return (dot(normal, viewDirection) < 0.0f) ? -normal : normal;
++}
++
++float traceOcclusion(float3 origin, float3 direction, float tMax, uint rayFlags) {
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.Direction = direction;
++    ray.TMin = 0.0f;
++    ray.TMax = tMax;
++
++    OcclusionPayload payload;
++    payload.hitT = 0.0f;
++    TraceRay(SceneBVH, rayFlags, 0xFF, 0, 0, 0, ray, payload);
++    return payload.hitT;
++}
++
++[shader("raygeneration")]
++void HybridRayGen() {
++    const int2 pixel = int2(DispatchRaysIndex().xy);
++    const float depth = gDepth.Load(int3(pixel, 0));
++    if (isSkyDepth(depth)) {
++        gOutput[pixel] = float2(1.0f, 1.0f);
++        gNormalDepth[pixel] = float4(0.0f, 0.0f, 0.0f, -1.0f);
++        return;
++    }
++
++    const float3 cameraPosition = gParams.cameraPosition.xyz;
++    const float3 position = reconstructPosition(pixel, depth);
++    const float3 normal = reconstructNormal(pixel, position, cameraPosition);
++    const float cameraDistance = distance(position, cameraPosition);
++
++    // Push the origin away from the surface proportionally to the distance, as depth reconstruction loses precision with distance.
++    const float bias = gParams.normalBias + cameraDistance * 0.002f;
++    const float3 origin = position + normal * bias;
++
++    // Stable per-pixel noise avoids flickering since there's no temporal accumulation. The spatial filter takes care of the noise.
++    float2 rotation = float2(interleavedGradientNoise(float2(pixel)), r2PixelNoise(float2(pixel)));
++    if (gParams.flags & HYBRID_RT_FLAG_TEMPORAL_NOISE) {
++        const uint frameSeed = hashUint(gParams.frameIndex);
++        rotation = frac(rotation + float2(uintToUnitFloat(frameSeed), uintToUnitFloat(hashUint(frameSeed))));
++    }
++
++    // Sun visibility.
++    float sunVisibility = 1.0f;
++    if (gParams.flags & HYBRID_RT_FLAG_SHADOWS) {
++        const float3 sunDirection = gParams.sunDirection.xyz;
++        const float nDotL = dot(normal, sunDirection);
++        if (nDotL <= 0.0f) {
++            sunVisibility = 0.0f;
++        }
++        else {
++            const float cosThetaMax = cos(gParams.sunAngularRadius);
++            const float3 rayDirection = (gParams.sunAngularRadius > 0.0f) ? sampleCone(sunDirection, cosThetaMax, rotation) : sunDirection;
++            const uint shadowFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE;
++            const float hitT = traceOcclusion(origin, rayDirection, gParams.shadowMaxDistance, shadowFlags);
++            sunVisibility = (hitT < 0.0f) ? 1.0f : 0.0f;
++            sunVisibility *= lerp(1.0f, saturate(nDotL), gParams.nDotLStrength);
++
++            // Fade out towards the terminator so low polygon curved surfaces don't show a hard edge where they turn away from the sun.
++            sunVisibility *= smoothstep(0.0f, 0.2f, nDotL);
++        }
++    }
++
++    // Ambient visibility.
++    float ambientVisibility = 1.0f;
++    if ((gParams.flags & HYBRID_RT_FLAG_AMBIENT_OCCLUSION) && (gParams.aoSamples > 0)) {
++        const float2 R2 = float2(0.7548776662f, 0.5698402910f);
++        float occlusion = 0.0f;
++        for (uint i = 0; i < gParams.aoSamples; i++) {
++            const float2 u = frac(rotation + R2 * float(i + 1));
++            const float3 rayDirection = sampleCosineHemisphere(normal, u);
++            const float hitT = traceOcclusion(origin, rayDirection, gParams.aoRadius, RAY_FLAG_FORCE_OPAQUE);
++            if (hitT >= 0.0f) {
++                const float x = saturate(hitT / gParams.aoRadius);
++                occlusion += 1.0f - x * x;
++            }
++        }
++
++        ambientVisibility = 1.0f - (occlusion / float(gParams.aoSamples));
++    }
++
++    gOutput[pixel] = float2(sunVisibility, ambientVisibility);
++    gNormalDepth[pixel] = float4(normal, cameraDistance);
++}
++
++[shader("miss")]
++void HybridMiss(inout OcclusionPayload payload) {
++    payload.hitT = -1.0f;
++}
++
++[shader("closesthit")]
++void HybridClosestHit(inout OcclusionPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    payload.hitT = RayTCurrent();
++}
+diff --git a/src/shaders/HybridRtWorldCS.hlsl b/src/shaders/HybridRtWorldCS.hlsl
+new file mode 100644
+index 0000000..88d78b0
+--- /dev/null
++++ b/src/shaders/HybridRtWorldCS.hlsl
+@@ -0,0 +1,37 @@
++//
++// RT64
++//
++// Computes the world space position of every vertex in the workload so they can be used as the
++// input geometry for the acceleration structure. Unlike RSPWorldCS, this shader doesn't depend on
++// the previous frame being matched, as it only needs the current world transforms.
++//
++
++#include "shared/rt64_hybrid_raytracing_params.h"
++
++#define GROUP_SIZE 64
++
++[[vk::push_constant]] ConstantBuffer<HybridRaytracingWorldCB> gConstants : register(b0);
++Buffer<float> srcPos : register(t1);
++Buffer<float> srcVel : register(t2);
++Buffer<uint> srcIndices : register(t3);
++StructuredBuffer<float4x4> worldMats : register(t4);
++RWStructuredBuffer<float4> dstPos : register(u5);
++
++[numthreads(GROUP_SIZE, 1, 1)]
++void CSMain(uint vertexIndex : SV_DispatchThreadID) {
++    if (vertexIndex >= gConstants.vertexCount) {
++        return;
++    }
++
++    const uint vertexOffsetIndex = gConstants.vertexStart + vertexIndex;
++    const uint transformIndex = srcIndices[vertexOffsetIndex];
++    const uint posIndex = vertexOffsetIndex * 3;
++    const float3 pos = float3(srcPos[posIndex + 0], srcPos[posIndex + 1], srcPos[posIndex + 2]);
++    const float3 vel = float3(srcVel[posIndex + 0], srcVel[posIndex + 1], srcVel[posIndex + 2]);
++    const float4 worldPos = mul(worldMats[transformIndex], float4(pos - vel * (1.0f - gConstants.curFrameWeight), 1.0f));
++
++    // World transforms are expected to be affine, but guard against inserted projective matrices since the
++    // acceleration structure builder only reads the XYZ components.
++    const float w = (abs(worldPos.w) > 1e-6f) ? worldPos.w : 1.0f;
++    dstPos[vertexOffsetIndex] = float4(worldPos.xyz / w, 1.0f);
++}
+diff --git a/src/shared/rt64_hybrid_raytracing_params.h b/src/shared/rt64_hybrid_raytracing_params.h
+new file mode 100644
+index 0000000..a12f30f
+--- /dev/null
++++ b/src/shared/rt64_hybrid_raytracing_params.h
+@@ -0,0 +1,76 @@
++//
++// RT64
++//
++// Parameters shared between the CPU and the GPU for the hybrid ray traced
++// shadows and ambient occlusion pass.
++//
++
++#pragma once
++
++#include "shared/rt64_hlsl.h"
++
++#define HYBRID_RT_FLAG_SHADOWS          (1U << 0)
++#define HYBRID_RT_FLAG_AMBIENT_OCCLUSION (1U << 1)
++#define HYBRID_RT_FLAG_TEMPORAL_NOISE   (1U << 2)
++#define HYBRID_RT_FLAG_RESET_STATS      (1U << 3)
++#define HYBRID_RT_FLAG_INTERIOR_DETECTION (1U << 4)
++
++#define HYBRID_RT_DEBUG_NONE            0
++#define HYBRID_RT_DEBUG_SHADOWS         1
++#define HYBRID_RT_DEBUG_AMBIENT_OCCLUSION 2
++#define HYBRID_RT_DEBUG_COMBINED        3
++#define HYBRID_RT_DEBUG_NORMALS         4
++
++#ifdef HLSL_CPU
++namespace interop {
++#endif
++    struct HybridRaytracingParams {
++        // Transforms a target pixel coordinate and its depth buffer value (x, y, depth, 1) into homogeneous world space.
++        float4x4 pixelToWorld;
++
++        // World space position of the camera (xyz).
++        float4 cameraPosition;
++
++        // Normalized world space direction towards the sun (xyz).
++        float4 sunDirection;
++
++        // Size of the region being traced in pixels.
++        uint2 resolution;
++        uint frameIndex;
++        uint flags;
++
++        uint aoSamples;
++        uint debugView;
++        uint denoiseRadius;
++        uint padding0;
++
++        float aoRadius;
++        float shadowMaxDistance;
++        float sunAngularRadius;
++        float normalBias;
++
++        float shadowStrength;
++        float aoStrength;
++        float nDotLStrength;
++        float skyDepth;
++
++        float denoiseDepthSigma;
++        float denoiseNormalPower;
++        float interiorFadeStart;
++        float interiorFadeEnd;
++    };
++
++    struct HybridRaytracingDispatchCB {
++        uint2 resolution;
++        uint2 direction;
++    };
++
++    struct HybridRaytracingWorldCB {
++        uint vertexStart;
++        uint vertexCount;
++        float curFrameWeight;
++        uint padding;
++    };
++#ifdef HLSL_CPU
++};
++#endif
