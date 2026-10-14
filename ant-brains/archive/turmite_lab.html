@@ -1,0 +1,546 @@
+<title>Turmite Wiring Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a lab bench. Left = the growth plate (canvas) with transport + readouts;
+   right = the genome (rule table) and the evolution panel. Stacks on phones. */
+:root {
+  --bg: #e9eeec;          /* bench surface, faintly green-grey */
+  --panel: #f6f8f7;
+  --ink: #16201d;
+  --muted: #5a6964;
+  --line: #c9d3cf;
+  --accent: #c2410c;      /* neurons: a hot signal colour */
+  --wire: #3346a8;        /* local wires */
+  --wire-long: #0f8a6a;   /* long-range shortcuts */
+  --ant: #16201d;
+  --cell0: #f6f8f7;       /* empty plate */
+  --cell1: #c7d3ea;
+  --cell2: #b4cdbd;
+  --cell3: #ead2b4;
+  --focus: #3346a8;
+  --font-display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1412; --panel: #151d1a; --ink: #e3ebe7; --muted: #92a39c; --line: #2a3632;
+    --accent: #ff8a4c; --wire: #8ea2ff; --wire-long: #4fd1a8; --ant: #ffffff;
+    --cell0: #121a17; --cell1: #23324d; --cell2: #1f3b2c; --cell3: #43341f; --focus: #8ea2ff;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1412; --panel: #151d1a; --ink: #e3ebe7; --muted: #92a39c; --line: #2a3632;
+  --accent: #ff8a4c; --wire: #8ea2ff; --wire-long: #4fd1a8; --ant: #ffffff;
+  --cell0: #121a17; --cell1: #23324d; --cell2: #1f3b2c; --cell3: #43341f; --focus: #8ea2ff;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 15px; line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 28px 48px;
+}
+.wrap { max-width: 1240px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+header { display: flex; flex-direction: column; gap: 6px; max-width: 72ch; }
+.eyebrow { font-family: var(--font-data); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(28px, 4.2vw, 42px); line-height: 1.05; margin: 0; text-wrap: balance; letter-spacing: -.01em; }
+header p { margin: 0; color: var(--muted); }
+
+.bench { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+@media (max-width: 900px) { .bench { grid-template-columns: minmax(0, 1fr); } }
+
+.plate { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.dish {
+  position: relative; width: 100%; aspect-ratio: 4 / 3; max-width: 100%;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--cell0);
+}
+canvas { display: block; width: 100%; height: 100%; }
+.status-chip {
+  position: absolute; top: 10px; left: 10px; font-family: var(--font-data); font-size: 12px;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  padding: 3px 9px; border-radius: 999px; display: flex; align-items: center; gap: 6px;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.dot.live { background: var(--accent); }
+
+.transport { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button, select, input[type=text] {
+  font: inherit; font-size: 14px; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 12px;
+}
+button { cursor: pointer; font-weight: 500; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+button.primary:hover { opacity: .9; }
+button:disabled { opacity: .5; cursor: default; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.speed { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.speed input { width: 110px; accent-color: var(--accent); }
+.layers { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); }
+.layers label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+.layers input { accent-color: var(--accent); }
+.swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.readout {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+  background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+@media (max-width: 520px) { .readout { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.readout div { background: var(--panel); padding: 9px 12px; display: flex; flex-direction: column; gap: 1px; }
+.readout dt { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.readout dd { margin: 0; font-family: var(--font-data); font-size: 18px; font-variant-numeric: tabular-nums; }
+
+aside { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+h2 { font-family: var(--font-display); font-weight: 700; font-size: 19px; margin: 0; }
+.card p { margin: 0; color: var(--muted); font-size: 14px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.row label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+tr:last-child td { border-bottom: 0; }
+td select { padding: 3px 6px; font-size: 13px; font-family: var(--font-data); }
+td.key { font-family: var(--font-data); color: var(--muted); }
+.cellchip { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--line); vertical-align: -2px; margin-right: 4px; }
+tr.flash td { animation: flash 1.2s ease-out; }
+@keyframes flash { from { background: color-mix(in srgb, var(--accent) 28%, transparent); } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { tr.flash td { animation: none; } }
+
+.genome { display: flex; gap: 8px; }
+.genome input { flex: 1; min-width: 0; font-family: var(--font-data); font-size: 12px; }
+.note { font-size: 12px; color: var(--muted); }
+
+.evo-chart { width: 100%; height: 54px; display: block; }
+.legend { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 13px; color: var(--muted); }
+.legend code { font-family: var(--font-data); color: var(--ink); }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Growth by rule table · turmites</span>
+    <h1>Turmite Wiring Lab</h1>
+    <p>Langton's ant with extra rules. Each ant reads the colour under it and its own state, then looks up one row of the rule table: what colour to leave, which way to turn, which state to switch to, and whether to drop a neuron, split in two, or stop. Ants that walk from one neuron onto another lay a wire between them. The rule table is the genome.</p>
+  </header>
+
+  <div class="bench">
+    <div class="plate">
+      <div class="dish">
+        <canvas id="cv" aria-label="Grid where ants grow a network"></canvas>
+        <div class="status-chip"><span class="dot" id="dot"></span><span id="statusText">paused</span></div>
+      </div>
+      <div class="transport">
+        <button class="primary" id="playBtn">Grow</button>
+        <button id="stepBtn">Step</button>
+        <button id="resetBtn">Reset plate</button>
+        <span class="speed"><label for="speed">Speed</label><input type="range" id="speed" min="1" max="200" value="20"></span>
+      </div>
+      <div class="layers">
+        <label><input type="checkbox" id="lyTrails" checked> trails</label>
+        <label><input type="checkbox" id="lyWires" checked> <span class="swatch" style="background:var(--wire)"></span> local wires</label>
+        <label><input type="checkbox" id="lyLong" checked> <span class="swatch" style="background:var(--wire-long)"></span> long-range</label>
+        <label><input type="checkbox" id="lyNeurons" checked> neurons</label>
+        <label><input type="checkbox" id="lyAnts" checked> ants</label>
+      </div>
+      <dl class="readout">
+        <div><dt>Steps</dt><dd id="sSteps">0</dd></div>
+        <div><dt>Ants alive</dt><dd id="sAnts">1</dd></div>
+        <div><dt>Neurons</dt><dd id="sNeurons">1</dd></div>
+        <div><dt>Wires</dt><dd id="sLinks">0</dd></div>
+        <div><dt>Wires / neuron</dt><dd id="sDeg">0</dd></div>
+        <div><dt>Two-way</dt><dd id="sTwo">0%</dd></div>
+        <div><dt>Long-range</dt><dd id="sLong">0%</dd></div>
+        <div><dt>Fitness</dt><dd id="sFit">0.00</dd></div>
+      </dl>
+    </div>
+
+    <aside>
+      <section class="card">
+        <h2>Genome</h2>
+        <div class="row">
+          <label for="preset">Start from</label>
+          <select id="preset">
+            <option value="branch">Branching web</option>
+            <option value="lattice">Lattice</option>
+            <option value="cross">Cross</option>
+            <option value="spindle">Spindle</option>
+            <option value="classic">Classic Langton's ant</option>
+            <option value="custom" hidden>Custom</option>
+          </select>
+        </div>
+        <div class="row">
+          <label for="nStates">States</label>
+          <select id="nStates"><option>1</option><option>2</option><option selected>3</option><option>4</option></select>
+          <label for="nColors">Colours</label>
+          <select id="nColors"><option>2</option><option selected>3</option><option>4</option></select>
+          <button id="randomBtn">Random rules</button>
+          <button id="mutateBtn">Mutate one</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>If state</th><th>on</th><th>Write</th><th>Turn</th><th>Next</th><th>Action</th></tr></thead>
+            <tbody id="ruleBody"></tbody>
+          </table>
+        </div>
+        <div class="genome">
+          <input type="text" id="genomeTxt" aria-label="Genome string" spellcheck="false">
+          <button id="copyBtn">Copy</button>
+          <button id="loadBtn">Load</button>
+        </div>
+        <div class="legend">
+          <code>1R0n</code><span>write colour 1, turn right, go to state 0, drop a neuron</span>
+          <code>- n s x</code><span>no action · neuron · split · stop</span>
+        </div>
+        <p class="note" id="genomeNote">Edits to the table reset the plate and regrow.</p>
+      </section>
+
+      <section class="card">
+        <h2>Evolve the rules</h2>
+        <p>Each generation makes 16 mutants of the current genome, grows each one for 3,000 steps off-screen, and keeps the best. Fitness rewards lots of neurons, about four wires each, many two-way wires, and roughly 15% long-range shortcuts: the sparse, small-world wiring a brain has.</p>
+        <div class="row">
+          <button class="primary" id="evoBtn">Evolve 20 generations</button>
+          <button id="evo1Btn">1 generation</button>
+        </div>
+        <svg class="evo-chart" id="evoChart" viewBox="0 0 300 54" preserveAspectRatio="none" aria-label="Fitness over generations"></svg>
+        <p class="note" id="evoNote">No generations yet. Current fitness is shown under the plate.</p>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script>
+// ===================== Simulation core =====================
+const TURNS = ['L', 'R', 'N', 'U'];
+const ACT_CODE = { '-': '-', neuron: 'n', split: 's', stop: 'x' };
+const CODE_ACT = { '-': '-', n: 'neuron', s: 'split', x: 'stop' };
+const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+const W = 120, H = 90, MAX_STEPS = 12000;
+
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+let rand = mulberry32(Date.now() & 0xffffffff);
+
+function randomEntry(S, C) {
+  const a = rand();
+  return { write: Math.floor(rand() * C), turn: TURNS[Math.floor(rand() * 4)], next: Math.floor(rand() * S),
+           action: a < 0.55 ? '-' : a < 0.75 ? 'neuron' : a < 0.92 ? 'split' : 'stop' };
+}
+function randomRule(S, C) { return Array.from({ length: S }, () => Array.from({ length: C }, () => randomEntry(S, C))); }
+function cloneRule(r) { return r.map(row => row.map(e => ({ ...e }))); }
+function turnDir(d, t) { return t === 'L' ? (d + 3) % 4 : t === 'R' ? (d + 1) % 4 : t === 'U' ? (d + 2) % 4 : d; }
+
+class World {
+  constructor(rule) {
+    this.rule = rule; this.maxAnts = 48; this.maxNeurons = 400;
+    this.grid = new Uint8Array(W * H); this.neuronAt = new Int32Array(W * H).fill(-1);
+    this.neurons = []; this.edges = new Map(); this.steps = 0;
+    const cx = W >> 1, cy = H >> 1, n0 = this.addNeuron(cx, cy);
+    this.ants = [{ x: cx, y: cy, dir: 0, state: 0, last: n0, alive: true }];
+  }
+  addNeuron(x, y) { const id = this.neurons.length; this.neurons.push({ x, y }); this.neuronAt[y * W + x] = id; return id; }
+  connect(a, b) { if (a < 0 || b < 0 || a === b) return; const k = a + '>' + b; if (!this.edges.has(k)) this.edges.set(k, [a, b]); }
+  aliveCount() { let n = 0; for (const a of this.ants) if (a.alive) n++; return n; }
+  step() {
+    const born = [];
+    for (const ant of this.ants) {
+      if (!ant.alive) continue;
+      const i = ant.y * W + ant.x, r = this.rule[ant.state][this.grid[i]];
+      this.grid[i] = r.write;
+      const here = this.neuronAt[i];
+      if (here >= 0 && here !== ant.last) { this.connect(ant.last, here); ant.last = here; }
+      if (r.action === 'neuron' && here < 0 && this.neurons.length < this.maxNeurons) {
+        const id = this.addNeuron(ant.x, ant.y); this.connect(ant.last, id); ant.last = id;
+      } else if (r.action === 'split' && this.ants.length + born.length < this.maxAnts) {
+        const m = r.turn === 'L' ? 'R' : r.turn === 'R' ? 'L' : r.turn === 'N' ? 'U' : 'N';
+        born.push({ x: ant.x, y: ant.y, dir: turnDir(ant.dir, m), state: r.next, last: ant.last, alive: true });
+      } else if (r.action === 'stop') { ant.alive = false; continue; }
+      ant.dir = turnDir(ant.dir, r.turn); ant.state = r.next;
+      ant.x = (ant.x + DX[ant.dir] + W) % W; ant.y = (ant.y + DY[ant.dir] + H) % H;
+    }
+    for (const b of born) { b.x = (b.x + DX[b.dir] + W) % W; b.y = (b.y + DY[b.dir] + H) % H; this.ants.push(b); }
+    this.steps++;
+  }
+  isLong(a, b) {
+    const p = this.neurons[a], q = this.neurons[b];
+    let dx = Math.abs(p.x - q.x), dy = Math.abs(p.y - q.y);
+    return Math.min(dx, W - dx) + Math.min(dy, H - dy) > 12;
+  }
+  stats() {
+    const n = this.neurons.length, e = this.edges.size; let two = 0, long = 0;
+    for (const [a, b] of this.edges.values()) { if (this.edges.has(b + '>' + a)) two++; if (this.isLong(a, b)) long++; }
+    return { neurons: n, links: e, avgOut: n ? e / n : 0, twoWay: e ? two / e : 0, longRange: e ? long / e : 0 };
+  }
+}
+function fitness(s) {
+  if (s.neurons < 8) return 0;
+  const size = Math.min(s.neurons, 200) / 200, degree = Math.min(s.avgOut, 4) / 4, recip = 0.3 + s.twoWay;
+  const sw = 1 - Math.abs(s.longRange - 0.15) * 2;
+  return Math.max(0, size * degree * recip * Math.max(0.1, sw));
+}
+function evaluate(rule, steps = 3000) {
+  const w = new World(rule);
+  for (let i = 0; i < steps; i++) { if (!w.aliveCount()) break; w.step(); }
+  return fitness(w.stats());
+}
+
+// ===================== Genome text =====================
+function toGenome(rule) { return rule.map(row => row.map(e => '' + e.write + e.turn + e.next + ACT_CODE[e.action]).join(' ')).join(' | '); }
+function fromGenome(txt) {
+  const rows = txt.trim().split('|').map(r => r.trim().split(/\s+/));
+  const S = rows.length, C = rows[0].length;
+  if (S < 1 || S > 4 || C < 2 || C > 4) throw new Error('Use 1–4 states and 2–4 colours.');
+  return rows.map(row => {
+    if (row.length !== C) throw new Error('Every state needs the same number of entries.');
+    return row.map(tok => {
+      const m = /^([0-3])([LRNU])([0-3])([-nsx])$/.exec(tok);
+      if (!m) throw new Error(`"${tok}" isn't a valid entry. Use a form like 1R0n.`);
+      const e = { write: +m[1], turn: m[2], next: +m[3], action: CODE_ACT[m[4]] };
+      if (e.write >= C || e.next >= S) throw new Error(`"${tok}" points to a colour or state that doesn't exist.`);
+      return e;
+    });
+  });
+}
+const PRESETS = {
+  branch:  '1R0- 2U1- 0U2- | 1L2s 2L1- 2R2- | 2U2- 0U2n 2L1-',
+  lattice: '0L2- 1N2s 0N1- 2L0s | 0N0- 1R1- 3U0- 2L0- | 3N1n 3N2- 2R2s 3R1s',
+  cross:   '2U2- 0U0- 1R0n | 0R2s 0R2- 2N0n | 0L1n 1R2- 2U0-',
+  spindle: '0N2n 2L1s 1N2- 3L0s | 3L0- 0N2- 2N2- 2L0n | 1N2n 2U2- 2N1s 1L1-',
+  classic: '1R0- 0L0-',
+};
+
+// ===================== UI state =====================
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+let rule = fromGenome(PRESETS.branch), world = new World(rule), running = false, rafId = 0;
+let evoHistory = [], evolving = false;
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function hexToRgb(c) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(c); if (!m) return [128, 128, 128];
+  const n = parseInt(m[1], 16); return [n >> 16 & 255, n >> 8 & 255, n & 255];
+}
+
+// ---------- drawing ----------
+const off = document.createElement('canvas'); off.width = W; off.height = H;
+const offCtx = off.getContext('2d'), img = offCtx.createImageData(W, H);
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr); draw();
+}
+function draw() {
+  const cell = [css('--cell0'), css('--cell1'), css('--cell2'), css('--cell3')].map(hexToRgb);
+  const showTrails = $('lyTrails').checked;
+  for (let i = 0; i < W * H; i++) {
+    const c = cell[showTrails ? world.grid[i] : 0], j = i * 4;
+    img.data[j] = c[0]; img.data[j + 1] = c[1]; img.data[j + 2] = c[2]; img.data[j + 3] = 255;
+  }
+  offCtx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, cv.width, cv.height);
+  const sx = cv.width / W, sy = cv.height / H, cxp = x => (x + .5) * sx, cyp = y => (y + .5) * sy;
+
+  const showLocal = $('lyWires').checked, showLong = $('lyLong').checked;
+  if (showLocal || showLong) {
+    ctx.lineWidth = Math.max(1, sx * 0.18);
+    for (const pass of [0, 1]) {
+      const long = pass === 1; if (long ? !showLong : !showLocal) continue;
+      ctx.strokeStyle = css(long ? '--wire-long' : '--wire'); ctx.globalAlpha = long ? .55 : .5;
+      ctx.beginPath();
+      for (const [a, b] of world.edges.values()) {
+        if (world.isLong(a, b) !== long) continue;
+        const p = world.neurons[a], q = world.neurons[b];
+        if (Math.abs(p.x - q.x) > W / 2 || Math.abs(p.y - q.y) > H / 2) continue; // wraps the edge
+        ctx.moveTo(cxp(p.x), cyp(p.y)); ctx.lineTo(cxp(q.x), cyp(q.y));
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  if ($('lyNeurons').checked) {
+    ctx.fillStyle = css('--accent'); const rad = Math.max(1.5, sx * 0.42);
+    ctx.beginPath();
+    for (const n of world.neurons) { ctx.moveTo(cxp(n.x) + rad, cyp(n.y)); ctx.arc(cxp(n.x), cyp(n.y), rad, 0, Math.PI * 2); }
+    ctx.fill();
+  }
+  if ($('lyAnts').checked) {
+    ctx.fillStyle = css('--ant'); ctx.strokeStyle = css('--cell0'); ctx.lineWidth = Math.max(1, sx * .15);
+    for (const a of world.ants) {
+      if (!a.alive) continue;
+      ctx.fillRect(a.x * sx, a.y * sy, sx, sy); ctx.strokeRect(a.x * sx, a.y * sy, sx, sy);
+    }
+  }
+}
+function updateStats() {
+  const s = world.stats();
+  $('sSteps').textContent = world.steps.toLocaleString();
+  $('sAnts').textContent = world.aliveCount();
+  $('sNeurons').textContent = s.neurons;
+  $('sLinks').textContent = s.links.toLocaleString();
+  $('sDeg').textContent = s.avgOut.toFixed(1);
+  $('sTwo').textContent = Math.round(s.twoWay * 100) + '%';
+  $('sLong').textContent = Math.round(s.longRange * 100) + '%';
+  $('sFit').textContent = fitness(s).toFixed(2);
+}
+function setStatus() {
+  const done = !world.aliveCount() || world.steps >= MAX_STEPS;
+  $('dot').classList.toggle('live', running);
+  $('statusText').textContent = running ? 'growing' : done ? (world.aliveCount() ? 'step limit reached' : 'all ants stopped') : 'paused';
+  $('playBtn').textContent = running ? 'Pause' : 'Grow';
+}
+
+// ---------- run loop ----------
+function tick() {
+  const n = +$('speed').value;
+  for (let i = 0; i < n; i++) {
+    if (!world.aliveCount() || world.steps >= MAX_STEPS) { running = false; break; }
+    world.step();
+  }
+  draw(); updateStats(); setStatus();
+  if (running) rafId = requestAnimationFrame(tick);
+}
+function play() { if (running) return; if (!world.aliveCount() || world.steps >= MAX_STEPS) resetWorld(); running = true; setStatus(); rafId = requestAnimationFrame(tick); }
+function pause() { running = false; cancelAnimationFrame(rafId); setStatus(); }
+function resetWorld(autoplay) { pause(); world = new World(rule); draw(); updateStats(); setStatus(); if (autoplay) play(); }
+
+// ---------- rule table ----------
+const COLOR_VARS = ['--cell0', '--cell1', '--cell2', '--cell3'];
+const COLOR_NAMES = ['empty', 'blue', 'green', 'sand'];
+const TURN_NAMES = { L: 'L left', R: 'R right', N: 'N straight', U: 'U u-turn' };
+const ACT_NAMES = { '-': '— none', neuron: 'n neuron', split: 's split', stop: 'x stop' };
+function sel(id, opts, val) {
+  const s = document.createElement('select'); s.id = id;
+  for (const [v, label] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = label; if (String(v) === String(val)) o.selected = true; s.append(o); }
+  return s;
+}
+function renderTable(flash) {
+  const S = rule.length, C = rule[0].length, body = $('ruleBody'); body.replaceChildren();
+  rule.forEach((row, s) => row.forEach((e, c) => {
+    const tr = document.createElement('tr');
+    if (flash && flash[0] === s && flash[1] === c) tr.className = 'flash';
+    const k1 = document.createElement('td'); k1.className = 'key'; k1.textContent = s;
+    const k2 = document.createElement('td'); k2.className = 'key';
+    k2.innerHTML = `<span class="cellchip" style="background:var(${COLOR_VARS[c]})"></span>${c}`;
+    const cols = [
+      sel(`w${s}_${c}`, Array.from({ length: C }, (_, i) => [i, `${i} ${COLOR_NAMES[i]}`]), e.write),
+      sel(`t${s}_${c}`, TURNS.map(t => [t, TURN_NAMES[t]]), e.turn),
+      sel(`n${s}_${c}`, Array.from({ length: S }, (_, i) => [i, 'state ' + i]), e.next),
+      sel(`a${s}_${c}`, Object.keys(ACT_NAMES).map(a => [a, ACT_NAMES[a]]), e.action),
+    ];
+    const keys = ['write', 'turn', 'next', 'action'];
+    tr.append(k1, k2);
+    cols.forEach((el, i) => {
+      el.setAttribute('aria-label', `State ${s} on colour ${c}: ${keys[i]}`);
+      el.addEventListener('change', () => {
+        const v = el.value; e[keys[i]] = (keys[i] === 'write' || keys[i] === 'next') ? +v : v;
+        markCustom(); syncGenome(); resetWorld(true);
+      });
+      const td = document.createElement('td'); td.append(el); tr.append(td);
+    });
+    body.append(tr);
+  }));
+  $('nStates').value = S; $('nColors').value = C;
+}
+function syncGenome() { $('genomeTxt').value = toGenome(rule); }
+function markCustom() { $('preset').value = 'custom'; }
+function setRule(r, flash) { rule = r; renderTable(flash); syncGenome(); resetWorld(true); }
+
+$('preset').addEventListener('change', e => { if (PRESETS[e.target.value]) { evoHistory = []; drawEvo(); setRule(fromGenome(PRESETS[e.target.value])); } });
+$('randomBtn').addEventListener('click', () => { markCustom(); evoHistory = []; drawEvo(); setRule(randomRule(+$('nStates').value, +$('nColors').value)); });
+function onShape() { markCustom(); evoHistory = []; drawEvo(); setRule(randomRule(+$('nStates').value, +$('nColors').value)); }
+$('nStates').addEventListener('change', onShape);
+$('nColors').addEventListener('change', onShape);
+
+function mutate(r) {
+  const S = r.length, C = r[0].length, s = Math.floor(rand() * S), c = Math.floor(rand() * C), e = r[s][c];
+  const f = Math.floor(rand() * 4);
+  if (f === 0) e.write = Math.floor(rand() * C);
+  else if (f === 1) e.turn = TURNS[Math.floor(rand() * 4)];
+  else if (f === 2) e.next = Math.floor(rand() * S);
+  else e.action = ['-', 'neuron', 'split', 'stop'][Math.floor(rand() * 4)];
+  return [s, c];
+}
+$('mutateBtn').addEventListener('click', () => { const r = cloneRule(rule), at = mutate(r); markCustom(); setRule(r, at); });
+
+$('copyBtn').addEventListener('click', () => {
+  const t = $('genomeTxt');
+  navigator.clipboard?.writeText(t.value).then(() => { $('genomeNote').textContent = 'Genome copied.'; })
+    .catch(() => { t.select(); $('genomeNote').textContent = 'Selected. Press Ctrl+C or ⌘C to copy.'; });
+});
+$('loadBtn').addEventListener('click', () => {
+  try { const r = fromGenome($('genomeTxt').value); markCustom(); evoHistory = []; drawEvo(); setRule(r); $('genomeNote').textContent = 'Genome loaded.'; }
+  catch (err) { $('genomeNote').textContent = err.message; }
+});
+
+// ---------- evolution ----------
+function drawEvo() {
+  const svg = $('evoChart'); svg.replaceChildren();
+  const ns = 'http://www.w3.org/2000/svg';
+  const base = document.createElementNS(ns, 'line');
+  Object.entries({ x1: 0, x2: 300, y1: 53, y2: 53, stroke: 'var(--line)', 'stroke-width': 1 }).forEach(([k, v]) => base.setAttribute(k, v));
+  svg.append(base);
+  if (evoHistory.length < 2) return;
+  const max = Math.max(...evoHistory, 0.01), n = evoHistory.length;
+  const pts = evoHistory.map((v, i) => [i / (n - 1) * 296 + 2, 50 - v / max * 44]);
+  const area = document.createElementNS(ns, 'path');
+  area.setAttribute('d', `M${pts[0][0]},53 ` + pts.map(p => `L${p[0]},${p[1]}`).join(' ') + ` L${pts[n - 1][0]},53 Z`);
+  area.setAttribute('fill', 'var(--accent)'); area.setAttribute('fill-opacity', '.14');
+  const line = document.createElementNS(ns, 'polyline');
+  line.setAttribute('points', pts.map(p => p.join(',')).join(' '));
+  Object.entries({ fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke' }).forEach(([k, v]) => line.setAttribute(k, v));
+  svg.append(area, line);
+}
+function generation() {
+  const cur = evoHistory.length ? evoHistory[evoHistory.length - 1] : evaluate(rule);
+  if (!evoHistory.length) evoHistory.push(cur);
+  let best = null, bestScore = cur, bestAt = null;
+  for (let k = 0; k < 16; k++) {
+    const r = cloneRule(rule); let at = mutate(r); if (rand() < .5) at = mutate(r);
+    const sc = evaluate(r);
+    if (sc > bestScore) { best = r; bestScore = sc; bestAt = at; }
+  }
+  evoHistory.push(bestScore);
+  return best ? { rule: best, at: bestAt, score: bestScore, improved: true } : { score: cur, improved: false };
+}
+async function evolve(gens) {
+  if (evolving) return; evolving = true; pause();
+  $('evoBtn').disabled = $('evo1Btn').disabled = true; markCustom();
+  let improvedCount = 0;
+  for (let g = 0; g < gens; g++) {
+    const res = generation();
+    if (res.improved) { improvedCount++; rule = res.rule; renderTable(res.at); syncGenome(); world = new World(rule); draw(); updateStats(); }
+    drawEvo();
+    $('evoNote').textContent = `Generation ${evoHistory.length - 1}: best fitness ${res.score.toFixed(2)}.`;
+    await new Promise(r => setTimeout(r, 0));
+  }
+  $('evoNote').textContent = `Generation ${evoHistory.length - 1}: best fitness ${evoHistory[evoHistory.length - 1].toFixed(2)}. ${improvedCount} of ${gens} generation${gens > 1 ? 's' : ''} found a better genome.`;
+  evolving = false; $('evoBtn').disabled = $('evo1Btn').disabled = false;
+  resetWorld(true);
+}
+$('evoBtn').addEventListener('click', () => evolve(20));
+$('evo1Btn').addEventListener('click', () => evolve(1));
+
+// ---------- transport ----------
+$('playBtn').addEventListener('click', () => running ? pause() : play());
+$('stepBtn').addEventListener('click', () => { pause(); if (world.aliveCount()) world.step(); draw(); updateStats(); setStatus(); });
+$('resetBtn').addEventListener('click', () => resetWorld(false));
+['lyTrails', 'lyWires', 'lyLong', 'lyNeurons', 'lyAnts'].forEach(id => $(id).addEventListener('change', draw));
+new ResizeObserver(resize).observe(cv);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+// ---------- start: show a grown network at rest, then keep growing ----------
+renderTable(); syncGenome();
+for (let i = 0; i < 600; i++) world.step();
+resize(); updateStats(); setStatus();
+play();
+</script>

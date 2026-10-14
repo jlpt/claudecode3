@@ -1,0 +1,8 @@
+# Install PyTorch FIRST with the CUDA build (see RUNNING.md), then: pip install -r requirements.txt
+# pip then keeps the CUDA build, because torch is already installed.
+torch>=2.1
+numpy
+networkx
+scipy
+pandas
+matplotlib>=3.5

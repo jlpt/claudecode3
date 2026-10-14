@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+# --quick runs are smoke tests, not results.
+results/*_quick/
