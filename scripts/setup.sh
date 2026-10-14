@@ -8,11 +8,16 @@ RT64_DIR="$ROOT/BanjoRecomp/lib/rt64"
 PATCH="$ROOT/patches/rt64-hybrid-raytracing.patch"
 
 cd "$ROOT"
-git submodule update --init --recursive BanjoRecomp
 
-if git -C "$RT64_DIR" apply --reverse --check "$PATCH" 2> /dev/null; then
+# Check the sources out exactly as they are stored (LF line endings) so the patch applies cleanly.
+git -c core.autocrlf=false submodule update --init --recursive BanjoRecomp
+
+# --ignore-whitespace covers checkouts that were already converted to CRLF line endings.
+if git -C "$RT64_DIR" apply --reverse --check --ignore-whitespace "$PATCH" 2> /dev/null; then
     echo "The hybrid ray tracing patch is already applied to $RT64_DIR."
-else
-    git -C "$RT64_DIR" apply --whitespace=nowarn "$PATCH"
+elif git -C "$RT64_DIR" apply --whitespace=nowarn "$PATCH" 2> /dev/null || git -C "$RT64_DIR" apply --whitespace=nowarn --ignore-whitespace "$PATCH"; then
     echo "Applied the hybrid ray tracing patch to $RT64_DIR."
+else
+    echo "Failed to apply $PATCH to $RT64_DIR." >&2
+    exit 1
 fi

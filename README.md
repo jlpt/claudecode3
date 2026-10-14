@@ -42,34 +42,75 @@ No in-game screenshots are committed to this repository.
 ## Getting the source
 
 ```bash
-git clone https://github.com/jlpt/claudecode3.git
+git clone --branch claude/exciting-rubin-dzlckm https://github.com/jlpt/claudecode3.git
 cd claudecode3
-scripts/setup.sh          # Windows PowerShell: .\scripts\setup.ps1
+scripts/setup.sh          # Windows: powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
-`setup` checks out Banjo: Recompiled at the commit this patch was made for (`dbd52154`), along with all of its submodules. It then applies `patches/rt64-hybrid-raytracing.patch` to `BanjoRecomp/lib/rt64`. Running it again does no harm.
+`setup` checks out Banjo: Recompiled at the commit this patch was made for (`dbd52154`), along with all of its submodules. It then applies `patches/rt64-hybrid-raytracing.patch` to `BanjoRecomp/lib/rt64`. Running it again does no harm. The build scripts below run it for you.
 
 ## Building
+
+### Windows
+
+**1. Install the tools** (once):
+
+- [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) (Community is fine). In the installer, select:
+  - the **Desktop development with C++** workload;
+  - under *Individual components*, **C++ Clang Compiler for Windows** and **C++ CMake tools for Windows**.
+- [Git for Windows](https://git-scm.com/download/win).
+- [Python 3](https://www.python.org/downloads/windows/). Tick *Add python.exe to PATH*.
+- LLVM: run `winget install LLVM.LLVM`. It provides the `clang` and `ld.lld` that compile the game's patches.
+- make: install [Chocolatey](https://chocolatey.org/install), then run `choco install make` in an administrator PowerShell.
+
+**2. Get the code.** Use a short folder such as `C:\bk`, because some of the submodule paths are long:
+
+```powershell
+git config --global core.longpaths true
+git clone --branch claude/exciting-rubin-dzlckm https://github.com/jlpt/claudecode3.git C:\bk
+```
+
+**3. Build.** Open **Developer PowerShell for VS 2022** from the Start menu. A normal PowerShell window won't work, because it doesn't have the compiler set up. Then run:
+
+```powershell
+cd C:\bk
+powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 "C:\path\to\your\Banjo-Kazooie (USA).z64"
+```
+
+The script does the following:
+
+- Fetches the sources and applies the patch.
+- Decompresses your ROM with `scripts/decompress_rom.py`.
+- Builds N64Recomp and RSPRecomp at the pinned commit, and runs them to turn the game code into C.
+- Builds `BanjoRecomp\build-cmake\BanjoRecompiled.exe` with the same settings as Banjo: Recompiled's own Windows builds.
+
+The first build takes a while. You only need to run it again after updating the code.
+
+**4. Play.** Start the game from the `BanjoRecomp` folder, so it finds its `assets` folder and your `rt64_hybrid_rt.json`:
+
+```powershell
+cd C:\bk\BanjoRecomp
+.\build-cmake\BanjoRecompiled.exe --show-console
+```
+
+`--show-console` opens a log window. In it you should see `RT64: Hybrid ray tracing is supported on this device.` and, once you're in a level, `RT64: Hybrid ray tracing active: ...`. Pick your normal ROM in the launcher, not the decompressed copy.
+
+On Windows the game uses Direct3D 12 by default, and **the Direct3D 12 path has not been tested**. If anything looks wrong, switch *Graphics API* to **Vulkan** in the game's graphics settings and restart.
 
 ### Linux
 
 ```bash
-sudo apt-get install git cmake ninja-build libsdl2-dev libgtk-3-dev lld llvm clang cargo
+sudo apt-get install git cmake ninja-build libsdl2-dev libgtk-3-dev lld llvm clang python3
 scripts/build.sh /path/to/your/banjo-kazooie.z64
 ```
 
 The script does the following:
 
-- Decompresses the ROM with [bk_rom_compressor](https://github.com/MittenzHugg/bk_rom_compressor).
-- Builds and runs [N64Recomp](https://github.com/N64Recomp/N64Recomp) and RSPRecomp at the pinned commits.
+- Decompresses the ROM with `scripts/decompress_rom.py`, a dependency-free port of [bk_rom_compressor](https://github.com/MittenzHugg/bk_rom_compressor) that produces the same file byte for byte.
+- Builds and runs [N64Recomp](https://github.com/N64Recomp/N64Recomp) and RSPRecomp at the pinned commit.
 - Builds `BanjoRecomp/build-cmake/BanjoRecompiled`.
 
 Run the game from inside `BanjoRecomp/` so it finds the `assets` folder.
-
-### Windows
-
-1. Run `.\scripts\setup.ps1`.
-2. Follow Banjo: Recompiled's [BUILDING.md](https://github.com/BanjoRecomp/BanjoRecomp/blob/main/BUILDING.md) inside the `BanjoRecomp` folder, from step 2 onwards (Visual Studio 2022, decompress the ROM, run N64Recomp/RSPRecomp, build).
 
 ## Using it
 
@@ -132,7 +173,7 @@ Set `"developer_mode": true` in Banjo: Recompiled's `graphics.json` to unlock th
 | --- | --- |
 | `BanjoRecomp/` | Upstream Banjo: Recompiled, as a git submodule pinned to `dbd52154`. |
 | `patches/rt64-hybrid-raytracing.patch` | All the renderer changes, against RT64 `6f1c2d99`. |
-| `scripts/` | Setup and build scripts. |
+| `scripts/` | Setup and build scripts for Windows and Linux, and the ROM decompressor. |
 | `tools/hybrid_rt_test/` | Standalone harness that renders a synthetic scene with the real shaders, checks the depth-to-world reconstruction against the CPU, and writes PNGs. See below. |
 | `docs/screenshots/` | Harness output. |
 
