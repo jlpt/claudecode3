@@ -30,8 +30,11 @@ Side view, gravity down, floor at y = 0. The shoulder is a fixed pivot 73 cm abo
 | Ball | 10 cm radius, 0.4 kg, rolls on the floor (hollow-sphere rolling inertia and rolling resistance, so a pushed ball slows and stops), bounces off walls at ±90 cm. Penalty contacts with both arm links (capsules) and the floor. |
 | Trial | Arm starts hanging still. Ball rests at `ball_x`, target spot at `target_x`. 3 s to push the ball onto the target (5 cm tolerance) and leave it there. |
 
-Six training placements cover pushing outward, pulling back toward the body and pushing across under the shoulder,
-to both sides (`hnarm/evaluate.py: TRAIN_TRIALS`). `replay.py` also tests random placements the brain never saw.
+The eight training placements come in contrast pairs (`hnarm/evaluate.py: TRAIN_TRIALS`): each ball position appears
+twice, once with the target further out and once with it back toward the body. A brain that ignores the target can
+win at most one of each pair. `replay.py` also tests random placements the brain never saw, and runs a target test:
+it keeps the ball still, moves only the target, and reports whether the ball's final position changes by more than
+noise alone would explain.
 
 Fitness, averaged over trials:
 
@@ -50,6 +53,10 @@ cortico-cortical feedback loops were fully switched on. A saturated cortex canno
 say where the ball and target are, so moving the target changed nothing (cutting vision off only dropped success
 from 33% to 25%). The saturation penalty and weaker feedback keep the cortex in a range where it can encode the
 scene. The direction term rewards the first small step toward a movement that depends on what the brain sees.
+
+A second run, with the cortex no longer saturated, was still blind at generation 25. The placements were the culprit:
+no two shared a ball position, so a swing that only reacted to where the ball was (a few centimetres changing how a
+fixed swing hits it) could score without looking at the target. That is why the placements now come in pairs.
 
 ## The brain
 
@@ -136,7 +143,7 @@ targets scored −0.2 instead of +0.94 with the noise switched off. So now:
 
 - every generation draws fresh noise, and every genome, elites included, is re-scored on it;
 - each placement is played `--repeats` times (default 2) with different noise;
-- every 5 generations the top 3 genomes are scored on separate validation noise (6 placements × 4 repeats), and the
+- every 5 generations the top 3 genomes are scored on separate validation noise (8 placements × 4 repeats), and the
   best of those is saved as `champion.json`.
 
 `replay.py` reports how often the champion lands on target over 10 further noise repeats per placement, on the
@@ -158,7 +165,7 @@ training placements and on held-out ones.
 | `train.py`, `replay.py` | Command-line entry points |
 
 Speed: all genomes in a worker and all their trials are simulated as one numpy batch. With the defaults
-(150 genomes × 6 placements × 2 repeats × 3 s at 1 ms) a generation takes about 11 s on 4 cores.
+(150 genomes × 8 placements × 2 repeats × 3 s at 1 ms) a generation takes about 15 s on 4 cores.
 
 ## Simplifications
 

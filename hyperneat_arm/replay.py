@@ -19,6 +19,34 @@ from hnarm.io import load_champion
 from hnarm.viewer import write_page
 
 
+def target_test(sub, cfg, w, b, noise_seed, repeats=8) -> None:
+    """Keep the ball still and move only the target. A brain that uses vision sends the ball to different places.
+
+    Noise alone scatters where the ball ends, so a difference only counts if the spread between targets is well above
+    the scatter between repeats (a one-way ANOVA F ratio above 4, roughly p < 0.02 here)."""
+    targets = (-0.4, -0.1, 0.1, 0.4)
+    print("\n\n  target test: same ball, target moved (mean final ball position over "
+          f"{repeats} noise repeats)", end="")
+    for ball in (-0.2, 0.2):
+        trials = tuple((ball, t) for t in targets)
+        runs, seeds = noisy_runs(trials, noise_seed, repeats)
+        res = simulate(sub, cfg, w[None], b[None], runs, record_every=int(round(cfg.env.duration / cfg.env.dt)) - 1,
+                       noise_seeds=seeds)
+        ends = res["recording"].ball[-1, :, 0].reshape(repeats, len(targets))
+        final = ends.mean(0)
+        spread = final.max() - final.min()
+        within = ends.var(0, ddof=1).mean() + 1e-12
+        f_ratio = repeats * final.var(ddof=1) / within
+        cells = "  ".join(f"{t * 100:+.0f}->{x * 100:+.0f}" for t, x in zip(targets, final))
+        if spread >= 0.03 and f_ratio > 4.0:
+            verdict = f"reacts to the target ({spread * 100:.0f} cm spread, F={f_ratio:.1f})"
+        elif spread < 0.03:
+            verdict = "ignores the target (ball ends within 3 cm whatever the target)"
+        else:
+            verdict = f"ignores the target (the {spread * 100:.0f} cm spread is within noise, F={f_ratio:.1f})"
+        print(f"\n    ball {ball * 100:+.0f} cm, target->ball end (cm): {cells}   {verdict}", end="")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("champion", help="champion.json written by train.py")
@@ -28,6 +56,8 @@ def main() -> None:
     ap.add_argument("--noise-seed", type=int, default=7, help="background-noise seed of the recorded trials")
     ap.add_argument("--robustness", type=int, default=10, help="also replay every placement this many times with "
                     "different noise and report how often the ball lands on target (0 to skip)")
+    ap.add_argument("--no-target-test", action="store_true",
+                    help="skip the check of whether moving the target changes where the brain sends the ball")
     ap.add_argument("--fragment", action="store_true", help="omit the doctype/head (for hosts that add their own)")
     args = ap.parse_args()
 
@@ -59,6 +89,8 @@ def main() -> None:
         print(f"\n  over {args.robustness} noise repeats per placement: training {rob[:, :n].mean():.0%} on target", end="")
         if held:
             print(f", held-out {rob[:, n:].mean():.0%}", end="")
+    if not args.no_target_test:
+        target_test(sub, cfg, w, b, args.noise_seed + 2)
     print("\n\n  mean firing rate per region (Hz): " +
           ", ".join(f"{k} {v:.0f}" for k, v in region_rates(sub, res["rate_hz"]).items()))
 

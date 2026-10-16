@@ -28,15 +28,15 @@ from .periphery import Muscles, Receptors
 from .snn import SpikingNetwork
 from .world import ArmBallWorld
 
-# (ball_x, target_x). Pushing outward, pulling back toward the body, and pushing across under the shoulder, to both
-# sides, so the brain has to read the scene instead of repeating one swing.
+# (ball_x, target_x), in contrast pairs: every ball position appears twice, once with the target further out and once
+# with it back toward the body. A brain that ignores the target can win at most one of each pair, so any sensitivity
+# to where the target is pays off directly. (Without pairs, evolution found swings that only react to where the ball
+# is, a few centimetres changing how a fixed swing hits it.)
 TRAIN_TRIALS = (
-    (-0.20, -0.40),
-    (0.20, 0.40),
-    (-0.25, 0.05),
-    (0.25, -0.05),
-    (-0.15, 0.25),
-    (0.15, -0.25),
+    (-0.25, -0.40), (-0.25, 0.05),
+    (-0.15, -0.35), (-0.15, 0.20),
+    (0.15, 0.35), (0.15, -0.20),
+    (0.25, 0.40), (0.25, -0.05),
 )
 
 
