@@ -39,7 +39,7 @@ def main() -> None:
     seeds = [(args.noise_seed, 0, t) for t in range(len(trials))]
     res = simulate(sub, cfg, w[None], b[None], trials, record_every=10, noise_seeds=seeds)
 
-    print(f"Champion from generation {generation}, training fitness {genome.fitness:.3f}")
+    print(f"Champion from generation {generation}, validation fitness {genome.fitness:.3f}")
     print(f"{len(sub.pre)} candidate synapses, {int(expressed.sum())} expressed:")
     for i, t in enumerate(TRACTS):
         m = sub.tract == i
