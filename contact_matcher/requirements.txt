@@ -1,0 +1,5 @@
+pandas
+openpyxl
+# Optional, but make large files much faster to process:
+python-calamine
+rapidfuzz
