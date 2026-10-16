@@ -80,9 +80,9 @@ class BrainConfig:
     # Peak synaptic weight of each tract before fan-in normalisation (weight = gain / sqrt(presynaptic population size)).
     tract_gain: dict = field(
         default_factory=lambda: {
-            "afferent": 20.0,
+            "afferent": 30.0,
             "feedforward": 10.0,
-            "feedback": 8.0,
+            "feedback": 4.0,
             "local_exc": 6.0,
             "local_inh": 16.0,
             "cerebellar": 8.0,
@@ -137,8 +137,13 @@ class Config:
     # Fitness weights.
     w_progress: float = 1.0
     w_precision: float = 1.0
+    w_direction: float = 0.5  # partial credit for moving the ball the right way at all
     w_reach: float = 0.25
     w_effort: float = 0.2
+    # Penalty for cortical neurons firing above saturation_hz. A cortex stuck at its maximum rate carries no
+    # information, which is how the first runs got stuck repeating one movement whatever they saw.
+    w_saturation: float = 0.5
+    saturation_hz: float = 40.0
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

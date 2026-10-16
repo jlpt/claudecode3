@@ -4,11 +4,13 @@ A trial: the arm starts hanging still, the ball rests on the floor at ``ball_x``
 floor at ``target_x``. The brain has ``duration`` seconds to push the ball onto the target and leave it there.
 
 Fitness per trial (averaged over trials):
-    w_progress  * clip(1 - final_error / initial_error, -1, 1)    how much closer the ball ended up
-  + w_precision * exp(-(final_error / tolerance)^2)               bonus for landing on the target
-  + w_reach     * exp(-closest_gap / 5 cm)                        shaping: get the arm to the ball at all
-  - w_effort    * mean squared muscle activation                  metabolic cost
-where final_error is the ball's mean distance from the target over the last ``settle_window`` seconds.
+    w_progress   * clip(1 - final_error / initial_error, -1, 1)          how much closer the ball ended up
+  + w_precision  * exp(-(final_error / tolerance)^2)                     bonus for landing on the target
+  + w_direction  * clip(displacement toward target / initial_error, -1, 1)  moved the right way, even if too far
+  + w_reach      * exp(-closest_gap / 5 cm)                              shaping: get the arm to the ball at all
+  - w_effort     * mean squared muscle activation                        metabolic cost
+  - w_saturation * mean over cortical neurons of clip((rate - saturation_hz) / saturation_hz, 0, 1)
+where final_error and the final position are averaged over the last ``settle_window`` seconds.
 """
 
 from __future__ import annotations
@@ -79,6 +81,7 @@ def simulate(sub: BrainSubstrate, cfg: Config, weights_t: np.ndarray, bias: np.n
     steps = int(round(env.duration / env.dt))
     settle = int(round(env.settle_window / env.dt))
     err_sum = np.zeros(B)
+    x_sum = np.zeros(B)
     min_gap = np.full(B, np.inf)
     effort = np.zeros(B)
     spike_count = np.zeros((P, T, sub.N), np.int32)
@@ -100,14 +103,20 @@ def simulate(sub: BrainSubstrate, cfg: Config, weights_t: np.ndarray, bias: np.n
         min_gap = np.minimum(min_gap, world.gaps.min(1))
         if k >= steps - settle:
             err_sum += np.abs(world.ball[:, 0] - world.target_x)
+            x_sum += world.ball[:, 0]
 
     d0 = np.abs(ball_x - target_x)
     err = err_sum / settle
     progress = np.clip(1.0 - err / d0, -1.0, 1.0)
     precision = np.exp(-((err / env.target_tolerance) ** 2))
+    direction = np.clip(np.sign(target_x - ball_x) * (x_sum / settle - ball_x) / d0, -1.0, 1.0)
     reach = np.exp(-np.maximum(min_gap, 0.0) / 0.05)
     effort = effort / steps
-    fitness = cfg.w_progress * progress + cfg.w_precision * precision + cfg.w_reach * reach - cfg.w_effort * effort
+    rate_hz = spike_count / env.duration
+    excess = np.clip((rate_hz[..., sub.cortical] - cfg.saturation_hz) / cfg.saturation_hz, 0.0, 1.0)
+    saturation = excess.mean(-1).reshape(B)
+    fitness = (cfg.w_progress * progress + cfg.w_precision * precision + cfg.w_direction * direction
+               + cfg.w_reach * reach - cfg.w_effort * effort - cfg.w_saturation * saturation)
     shape = (P, T)
     result = {
         "fitness": fitness.reshape(shape),
@@ -115,8 +124,10 @@ def simulate(sub: BrainSubstrate, cfg: Config, weights_t: np.ndarray, bias: np.n
         "progress": progress.reshape(shape),
         "reach": reach.reshape(shape),
         "effort": effort.reshape(shape),
+        "direction": direction.reshape(shape),
+        "saturation": saturation.reshape(shape),
         "success": (err < env.target_tolerance).reshape(shape),
-        "rate_hz": spike_count / env.duration,
+        "rate_hz": rate_hz,
     }
     if record_every:
         result["recording"] = Recording(
@@ -152,6 +163,7 @@ def score(genomes, sub: BrainSubstrate, cfg: Config, trials=TRAIN_TRIALS, noise_
             "error": float(res["error"][i].mean()),
             "reach": float(res["reach"][i].mean()),
             "effort": float(res["effort"][i].mean()),
+            "saturation": float(res["saturation"][i].mean()),
             "rates": region_rates(sub, res["rate_hz"][i : i + 1]),
         }
         out.append((float(res["fitness"][i].mean()), info))

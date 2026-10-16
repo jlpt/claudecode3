@@ -225,6 +225,7 @@ class BrainSubstrate:
         self.region_keys = list(self.regions)
         self.region_of = np.array([self.region_keys.index(pops[i].region) for i in self.pop_of])
         self.inhibitory = np.concatenate([np.full(p.n, p.inhibitory) for p in pops])
+        self.cortical = np.isin(np.array(self.region_keys)[self.region_of], ("S1", "PPC", "PMd", "M1"))
         izh = np.array([IZHIKEVICH[pops[i].cell] for i in self.pop_of])
         self.izh_a, self.izh_b, self.izh_c, self.izh_d = (izh[:, k].astype(np.float32) for k in range(4))
         self.input_keys = [k for k, p in self.populations.items() if p.region in ("VIS", "DRG")]

@@ -33,10 +33,23 @@ Side view, gravity down, floor at y = 0. The shoulder is a fixed pivot 73 cm abo
 Six training placements cover pushing outward, pulling back toward the body and pushing across under the shoulder,
 to both sides (`hnarm/evaluate.py: TRAIN_TRIALS`). `replay.py` also tests random placements the brain never saw.
 
-Fitness, averaged over trials: how much closer the ball ended up (`1 − final_error / initial_error`), a bonus for
-landing on target (`exp(−(error/5 cm)²)`), a small shaping term for touching the ball at all, minus a metabolic cost
-(mean squared muscle activation). `final_error` is averaged over the last 0.5 s, so a ball that rolls through the
-target does not count.
+Fitness, averaged over trials:
+
+- how much closer the ball ended up (`1 − final_error / initial_error`);
+- a bonus for landing on target (`exp(−(error/5 cm)²)`);
+- partial credit for moving the ball toward the target at all, even too far;
+- a small shaping term for touching the ball;
+- minus a metabolic cost (mean squared muscle activation);
+- minus a penalty for cortical neurons firing above 40 Hz.
+
+`final_error` is averaged over the last 0.5 s, so a ball that rolls through the target does not count.
+
+The last two terms come from a failed run. Its champion made the same backward swing in every trial, which happens
+to land two of the six placements. Its cortex had saturated: every layer 2/3 cell fired at 70–90 Hz because
+cortico-cortical feedback loops were fully switched on. A saturated cortex cannot carry the few visual spikes that
+say where the ball and target are, so moving the target changed nothing (cutting vision off only dropped success
+from 33% to 25%). The saturation penalty and weaker feedback keep the cortex in a range where it can encode the
+scene. The direction term rewards the first small step toward a movement that depends on what the brain sees.
 
 ## The brain
 
