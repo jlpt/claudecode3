@@ -8,6 +8,8 @@ paints the synaptic weights onto that brain.
 Only numpy is needed. Everything (physics, Izhikevich neurons, NEAT, HyperNEAT, the viewer) is in this folder.
 
 ```bash
+git clone -b claude/upbeat-bell-zacr9h https://github.com/jlpt/claudecode3.git
+cd claudecode3/hyperneat_arm
 pip install -r requirements.txt
 python train.py --generations 300 --workers 4 --out runs/demo     # evolve (Ctrl-C safe, see --resume)
 python replay.py runs/demo/champion.json --html runs/demo/replay.html
