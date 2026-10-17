@@ -95,7 +95,11 @@ cd C:\bk\BanjoRecomp
 
 `--show-console` opens a log window. In it you should see `RT64: Hybrid ray tracing is supported on this device.` and, once you're in a level, `RT64: Hybrid ray tracing active: ...`. Pick your normal ROM in the launcher, not the decompressed copy.
 
-On Windows the game uses Direct3D 12 by default, and **the Direct3D 12 path has not been tested**. If anything looks wrong, switch *Graphics API* to **Vulkan** in the game's graphics settings and restart.
+On Windows the game uses Direct3D 12 by default, and **the Direct3D 12 path has not been tested**, so Vulkan is the safer choice. The *Graphics API* option is hidden in the game's menus. To switch:
+
+1. Start the game once, then close it.
+2. Open `%LOCALAPPDATA%\BanjoRecompiled\graphics.json` in Notepad.
+3. Change `"api_option": "Auto"` to `"api_option": "Vulkan"`, and while you're there set `"developer_mode": true` (see below).
 
 ### Linux
 
