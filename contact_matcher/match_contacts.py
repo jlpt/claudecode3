@@ -6,26 +6,34 @@ Usage:
 
 Each distributor row is matched against the contacts database with the first
 rule below that finds a hit. Every comparison uses normalized text, so case,
-punctuation, "Inc"/"LLC" suffixes, "Street"/"St", "Suite"/"#", full state names,
-ZIP+4 codes and ZIPs that lost their leading zero in Excel don't block a match.
+punctuation, "Inc"/"LLC" suffixes, "Street"/"St", "Suite"/"#", "First"/"1st",
+full state names, ZIP+4 codes and ZIPs that lost their leading zero in Excel
+don't block a match.
 
     1. name + address + zip
     2. name + zip
     3. name + city + state
-    4. fuzzy name + zip     (similar name in the same zip, see --fuzzy-threshold)
-    5. address + zip        (same address, different name; worth a review)
+    4. partial name + zip   one name is the start of the other ("Wilco Farmers" and
+                            "Wilco Farmers Agrilliance LLC") and only one company fits
+    5. fuzzy name + zip     similar name in the same zip, see --fuzzy-threshold
+    6. address + zip        same address, different name; worth a review
+    7. same company, other location
+                            the name (whole or partial) fits exactly one company with
+                            addresses in the same state, but this location isn't in the
+                            database. Only company-wide columns are filled, each with
+                            that company's most common value.
 
-When several contacts match one distributor, their distinct values are joined
-with "; ". The output keeps every distributor column and adds the contact
-columns plus "Match Type" and "Match Count" so matches can be filtered and
-reviewed in Excel.
+Rules 1-6 copy the matched database rows; when several rows match, their
+distinct values are joined with "; ". The output keeps every distributor
+column and adds the contact columns plus "Match Type" and "Match Count" so
+matches can be filtered and reviewed in Excel.
 """
 
 import argparse
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +46,7 @@ CONTACT_KEY_COLUMNS = {
     "state": "Address State",
     "zip": "Address Zipcode",
 }
+CONTACT_ID_COLUMN = "Contact ID"
 
 # Columns in the distributor list.
 DISTRIBUTOR_KEY_COLUMNS = {
@@ -65,15 +74,18 @@ COPY_COLUMNS = {
     "Cp Phone 2": "Cp Phone 2",
 }
 
+# Contact columns that belong to one address rather than the whole company. They
+# stay blank for "same company, other location" rows, because the database has
+# no row for that location.
+LOCATION_COLUMNS = {"Address", "Address Email", "Address Phone", "Address Alt Phone 1", "Address Alt Phone 2"}
+
+PARTIAL_RULE = "partial name+zip"
 FUZZY_RULE = "fuzzy name+zip"
-MATCH_RULES = [
-    ("name+address+zip", ("name", "address", "zip")),
-    ("name+zip", ("name", "zip")),
-    ("name+city+state", ("name", "city", "state")),
-    (FUZZY_RULE, ("name", "zip")),
-    ("address+zip", ("address", "zip")),
-]
+ADDRESS_RULE = "address+zip"
+COMPANY_RULE = "same company, other location"
 NO_MATCH = "no match"
+RULE_ORDER = ["name+address+zip", "name+zip", "name+city+state", PARTIAL_RULE, FUZZY_RULE,
+              ADDRESS_RULE, COMPANY_RULE, NO_MATCH]
 
 EXCEL_CELL_LIMIT = 32767
 
@@ -109,6 +121,8 @@ ADDRESS_WORDS = {
     "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
     "suite": "unit", "ste": "unit", "apt": "unit", "apartment": "unit",
     "room": "unit", "rm": "unit",
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th",
+    "sixth": "6th", "seventh": "7th", "eighth": "8th", "ninth": "9th", "tenth": "10th",
 }
 
 CITY_WORDS = {"saint": "st", "fort": "ft", "mount": "mt"}
@@ -122,10 +136,13 @@ def _tokens(text):
     return _NON_ALNUM.sub(" ", text.lower().replace(".", "").replace("'", "")).split()
 
 
-def norm_name(text):
+def name_words(text):
     tokens = _tokens(text.replace("&", " and "))
-    kept = [t for t in tokens if t not in NAME_NOISE]
-    return "".join(kept or tokens)
+    return tuple(t for t in tokens if t not in NAME_NOISE) or tuple(tokens)
+
+
+def norm_name(text):
+    return "".join(name_words(text))
 
 
 def norm_address(text):
@@ -226,11 +243,14 @@ def resolve_columns(df, wanted, label, required):
 
 def match_keys(text, key_columns, label):
     columns = resolve_columns(text, list(key_columns.values()), label, required=True)
-    keys = {}
-    for key, column in key_columns.items():
+
+    def normalize(column, func):
         series = text[columns[column]]
         uniques = series.unique()
-        keys[key] = series.map(dict(zip(uniques, map(NORMALIZERS[key], uniques)))).tolist()
+        return series.map(dict(zip(uniques, map(func, uniques)))).tolist()
+
+    keys = {key: normalize(column, NORMALIZERS[key]) for key, column in key_columns.items()}
+    keys["words"] = normalize(key_columns["name"], name_words)
     return keys
 
 
@@ -242,31 +262,120 @@ def build_index(keys, fields):
     return index
 
 
-def match_rows(contact_keys, distributor_keys, fuzzy_threshold):
-    """Return (match type, contact row positions) for every distributor row."""
-    results = [(NO_MATCH, [])] * len(distributor_keys["name"])
-    for rule, fields in MATCH_RULES:
-        if rule == FUZZY_RULE and fuzzy_threshold <= 0:
+def build_partial_name_index(words, places):
+    """Index rows by each run of 2+ leading name words, and by whole name, per zip or state."""
+    starts, whole = defaultdict(list), defaultdict(list)
+    for position, (name, place) in enumerate(zip(words, places)):
+        if len(name) >= 2 and place:
+            whole[name, place].append(position)
+            for length in range(2, len(name) + 1):
+                starts[name[:length], place].append(position)
+    return starts, whole
+
+
+def find_partial_name(index, words, place):
+    """Rows whose name starts with `words`, or whose whole name is how `words` starts."""
+    starts, whole = index
+    if len(words) < 2 or not place:
+        return []
+    hits = list(starts.get((words, place), []))
+    for length in range(2, len(words)):
+        hits += whole.get((words[:length], place), [])
+    return hits
+
+
+def exact_lookup(contact_keys, distributor_keys, fields):
+    index = build_index(contact_keys, fields)
+    return lambda row: index.get(tuple(distributor_keys[f][row] for f in fields))
+
+
+def partial_name_lookup(contact_keys, distributor_keys, company_ids):
+    index = build_partial_name_index(contact_keys["words"], contact_keys["zip"])
+
+    def lookup(row):
+        hits = find_partial_name(index, distributor_keys["words"][row], distributor_keys["zip"][row])
+        address = distributor_keys["address"][row]
+        hits = [p for p in hits if address and contact_keys["address"][p] == address] or hits
+        # "Valley Farm" fits both "Valley Farm Supply" and "Valley Farm Store": skip it.
+        return hits if len({company_ids[p] for p in hits}) == 1 else None
+
+    return lookup
+
+
+def fuzzy_lookup(contact_keys, distributor_keys, threshold):
+    index = build_index(contact_keys, ("name", "zip"))
+    names_by_zip = defaultdict(list)
+    for name, zip_code in index:
+        names_by_zip[zip_code].append(name)
+
+    def lookup(row):
+        name, zip_code = distributor_keys["name"][row], distributor_keys["zip"][row]
+        best = name and best_fuzzy_match(name, names_by_zip.get(zip_code, []), threshold)
+        return index.get((best, zip_code)) if best else None
+
+    return lookup
+
+
+def match_companies(results, contact_keys, distributor_keys, company_ids):
+    """Give each unmatched row the one company its name fits in the same state, if any."""
+    exact = build_index(contact_keys, ("name", "state"))
+    partial = build_partial_name_index(contact_keys["words"], contact_keys["state"])
+    rows_by_company = defaultdict(list)
+    for position, company in enumerate(company_ids):
+        rows_by_company[company].append(position)
+
+    for row in range(len(results)):
+        if results[row][0] != NO_MATCH:
             continue
-        index = build_index(contact_keys, fields)
-        if rule == FUZZY_RULE:
-            names_by_zip = defaultdict(list)
-            for name, zip_code in index:
-                names_by_zip[zip_code].append(name)
-        for row, key in enumerate(zip(*(distributor_keys[f] for f in fields))):
-            if results[row][0] != NO_MATCH or not all(key):
-                continue
-            if rule == FUZZY_RULE:
-                name, zip_code = key
-                best = best_fuzzy_match(name, names_by_zip.get(zip_code, []), fuzzy_threshold)
-                key = (best, zip_code) if best else None
-            if key in index:
-                results[row] = (rule, index[key])
+        name, state = distributor_keys["name"][row], distributor_keys["state"][row]
+        hits = exact.get((name, state), []) + find_partial_name(partial, distributor_keys["words"][row], state)
+        companies = {company_ids[p] for p in hits}
+        if len(companies) == 1:
+            results[row] = (COMPANY_RULE, rows_by_company[companies.pop()])
+
+
+def match_rows(contact_keys, distributor_keys, company_ids, fuzzy_threshold):
+    """Return (match type, matched contact row positions) for every distributor row."""
+    rules = [
+        ("name+address+zip", exact_lookup(contact_keys, distributor_keys, ("name", "address", "zip"))),
+        ("name+zip", exact_lookup(contact_keys, distributor_keys, ("name", "zip"))),
+        ("name+city+state", exact_lookup(contact_keys, distributor_keys, ("name", "city", "state"))),
+        (PARTIAL_RULE, partial_name_lookup(contact_keys, distributor_keys, company_ids)),
+    ]
+    if fuzzy_threshold > 0:
+        rules.append((FUZZY_RULE, fuzzy_lookup(contact_keys, distributor_keys, fuzzy_threshold)))
+    rules.append((ADDRESS_RULE, exact_lookup(contact_keys, distributor_keys, ("address", "zip"))))
+
+    results = [(NO_MATCH, [])] * len(distributor_keys["name"])
+    for rule, lookup in rules:
+        for row in range(len(results)):
+            if results[row][0] == NO_MATCH:
+                hits = lookup(row)
+                if hits:
+                    results[row] = (rule, hits)
+    match_companies(results, contact_keys, distributor_keys, company_ids)
     return results
 
 
 def combine(values):
     return "; ".join(dict.fromkeys(v for v in values if v))[:EXCEL_CELL_LIMIT]
+
+
+def most_common(values):
+    counts = Counter(v for v in values if v)
+    return counts.most_common(1)[0][0] if counts else ""
+
+
+def output_column(results, values, location_level):
+    column = []
+    for rule, rows in results:
+        if rule != COMPANY_RULE:
+            column.append(combine(values[r] for r in rows))
+        elif location_level:
+            column.append("")
+        else:
+            column.append(most_common(values[r] for r in rows))
+    return column
 
 
 def write_table(df, path):
@@ -311,7 +420,10 @@ def main(argv=None):
 
     contact_keys = match_keys(contacts, CONTACT_KEY_COLUMNS, "Contacts file")
     distributor_keys = match_keys(as_text(distributors), DISTRIBUTOR_KEY_COLUMNS, "Distributors file")
-    results = match_rows(contact_keys, distributor_keys, args.fuzzy_threshold)
+    id_column = resolve_columns(contacts, [CONTACT_ID_COLUMN], "Contacts file", required=True)[CONTACT_ID_COLUMN]
+    # A contact row without an ID is treated as its own company.
+    company_ids = [cid or f"row {p}" for p, cid in enumerate(contacts[id_column])]
+    results = match_rows(contact_keys, distributor_keys, company_ids, args.fuzzy_threshold)
 
     copy_columns = resolve_columns(contacts, list(COPY_COLUMNS), "Contacts file", required=False)
     output_df = distributors.copy()
@@ -319,7 +431,7 @@ def main(argv=None):
     output_df["Match Count"] = [len(rows) for _, rows in results]
     for source, column in copy_columns.items():
         values = contacts[column].tolist()
-        output_df[COPY_COLUMNS[source]] = [combine(values[r] for r in rows) for _, rows in results]
+        output_df[COPY_COLUMNS[source]] = output_column(results, values, source in LOCATION_COLUMNS)
 
     print(f"Writing {output} ...")
     try:
@@ -329,9 +441,9 @@ def main(argv=None):
 
     counts = output_df["Match Type"].value_counts()
     print(f"\nDone in {time.perf_counter() - start:.1f}s")
-    for rule in [r for r, _ in MATCH_RULES] + [NO_MATCH]:
+    for rule in RULE_ORDER:
         if rule in counts:
-            print(f"  {rule:<18} {counts[rule]:>8,}")
+            print(f"  {rule:<30} {counts[rule]:>8,}")
 
 
 if __name__ == "__main__":

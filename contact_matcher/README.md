@@ -29,7 +29,8 @@ at the top of the script.
 `Match Type`, `Match Count`, `Matched Contact ID`, `Matched Contact Name`,
 `Matched Address`, `Contact Email`, `Address Email`, `Cp Name`, `Cp Email`,
 `Address Phone`, `Address Alt Phone 1`, `Address Alt Phone 2`, `Cp Phone`,
-`Cp Phone 2`. Edit `COPY_COLUMNS` in the script to change this list.
+`Cp Phone 2`. Edit `COPY_COLUMNS` in the script to change this list, and
+`LOCATION_COLUMNS` to change which columns count as address-specific.
 
 When one distributor matches several contacts (for example, several people at
 the same company), their distinct values are joined with `; `.
@@ -37,20 +38,31 @@ the same company), their distinct values are joined with `; `.
 ## How rows are matched
 
 Names, addresses, cities, states and ZIPs are normalized before comparing.
-Case, punctuation, Inc/LLC/Co suffixes, Street/St, Suite/Ste/#, full state names,
-ZIP+4 and ZIPs that lost their leading zero all compare equal. Each
-distributor gets the first rule that finds a match:
+Case, punctuation, Inc/LLC/Co suffixes, Street/St, Suite/Ste/#, First/1st,
+full state names, ZIP+4 and ZIPs that lost their leading zero all compare
+equal. Each distributor gets the first rule that finds a match:
 
 1. `name+address+zip`
 2. `name+zip`
 3. `name+city+state`
-4. `fuzzy name+zip`: a name at least 90% similar in the same ZIP
+4. `partial name+zip`: one name is the start of the other, such as
+   "Wilco Farmers" and "Wilco Farmers Agrilliance LLC", and only one company
+   (Contact ID) fits in that ZIP.
+5. `fuzzy name+zip`: a name at least 90% similar in the same ZIP
    (`--fuzzy-threshold 95` makes it stricter, `0` turns it off)
-5. `address+zip`: same address, different name. This can be a renamed company
+6. `address+zip`: same address, different name. This can be a renamed company
    or a different business in the same building, so check these rows.
+7. `same company, other location`: the name (whole or partial) fits exactly
+   one company with addresses in the same state, but this location isn't in
+   the database. Only the company-wide columns are filled (Contact ID and
+   name, Contact Email, Cp columns), each with that company's most common
+   value. The address columns stay blank. Independently owned stores that
+   share a name, like franchises, can land here, so check these rows.
 
-Rows with no match get `no match`. Filter the `Match Type` column in Excel to
-review the looser rules.
+Rows with no match get `no match`. That includes names that fit more than one
+company, such as "Valley Farm" when the database has both "Valley Farm Supply"
+and "Valley Farm Store". Filter the `Match Type` column in Excel to review the
+looser rules.
 
 ## Speed
 
